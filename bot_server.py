@@ -901,6 +901,37 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if page*size<total: parts.append(f"\nType: /users {scope} {page+1} size={size}" + (f" q={search}" if search else ""))
     await update.effective_message.reply_html("\n".join(parts), disable_web_page_preview=True)
 
+def parse_users_args(args: list[str]) -> tuple[str, int, int, Optional[str]]:
+    """
+    Returns (scope, page, size, search)
+      scope: "here" | "primary"
+      page: 1-based
+      size: items per page (<= 200)
+      search: optional string from q=...
+    """
+    scope = "here"
+    page = 1
+    size = 50
+    search = None
+    for a in args:
+        if a in ("here", "primary"):
+            scope = a
+        elif a.startswith("q="):
+            search = a[2:].strip()
+        elif re.fullmatch(r"\d+", a):
+            page = int(a)
+        elif re.fullmatch(r"\d+x\d+", a):
+            # "pagexsize" like 2x100
+            p, s = a.split("x", 1)
+            page, size = int(p), int(s)
+        elif a.startswith("size="):
+            try:
+                size = int(a.split("=",1)[1])
+            except: pass
+    size = max(1, min(size, 200))
+    page = max(1, page)
+    return scope, page, size, search
+
 @whitelist_only
 async def message_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args)<2: return await update.effective_message.reply_text("Usage: /message <user_id|@username> <text...>")
@@ -1659,7 +1690,7 @@ async def agree_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await allow_user(context, chat_id, user)
     except Exception:
         return await q.edit_message_text("Couldn’t unlock you (bot needs admin rights with 'Manage Members').")
-    await q.edit_message_text("✅ You’re unlocked. You can now chat in the group.")
+    await q.edit_message_text("✅ You’re unlocked. You can now receive messages from me.")
     try: await context.bot.send_message(chat_id, f"👋 {user.mention_html()} has been onboarded and unlocked.", parse_mode="HTML")
     except Exception: pass
 
@@ -1669,7 +1700,7 @@ async def greet_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username=(await context.bot.get_me()).username
     start_link=await build_start_link(bot_username, chat.id, chat.title)
     names=", ".join(m.mention_html() for m in update.message.new_chat_members)
-    text=f"Welcome {names}! 🔒 This group is gated.\n\nTap this link to DM the bot and unlock chat: {start_link}"
+    text=f"Welcome {names}! I would love to be able to converse with you.\n\nTap this link to allow me to DM you: {start_link}"
     await update.message.reply_html(text, disable_web_page_preview=True)
 
 # ──────────────────────────────────────────────────────────────
