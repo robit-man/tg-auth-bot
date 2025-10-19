@@ -8,7 +8,8 @@ and privacy-aware per-user "interaction profiles" updated during idle time.
 Python 3.10+
 """
 
-import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, math, random, asyncio, socket, threading, queue, traceback
+import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, math, random, asyncio, socket, threading, queue, traceback, glob
+from collections import defaultdict
 from pathlib import Path
 from contextlib import closing
 from functools import wraps
@@ -104,6 +105,19 @@ def write_env_template():
 
         PROFILES_ENABLED=true
         PROFILE_REFRESH_MINUTES=30
+
+        AUTO_RELOAD=true
+        AUTO_RELOAD_PATHS=bot_server.py
+        AUTO_RELOAD_INTERVAL=1.0
+
+        INTERNAL_REFLECTION_ENABLED=true
+        INTERNAL_REFLECTION_MAX_CHARS=1200
+
+        MEMORY_BUDGET_CHARS=600
+        MEMORY_THREAD_LIMIT=40
+        MEMORY_USER_LIMIT=60
+        MEMORY_GLOBAL_LIMIT=80
+        MEMORY_SUMMARY_BATCH=10
         """), encoding="utf-8")
 
 def ensure_env_file() -> dict:
@@ -137,6 +151,19 @@ AUTO_SYS_ENABLED = ((os.getenv("AUTO_SYSTEM_PROMPT_ENABLED") or (CFG.get("AUTO_S
 AUTO_SYS_INTERVAL_HOURS = int((os.getenv("AUTO_SYSTEM_PROMPT_INTERVAL_HOURS") or (CFG.get("AUTO_SYSTEM_PROMPT_INTERVAL_HOURS") or "12")).strip() or "12")
 PROFILES_ENABLED = ((os.getenv("PROFILES_ENABLED") or (CFG.get("PROFILES_ENABLED") or "true")).strip().lower()=="true")
 PROFILE_REFRESH_MINUTES = int((os.getenv("PROFILE_REFRESH_MINUTES") or (CFG.get("PROFILE_REFRESH_MINUTES") or "30")).strip() or "30")
+
+AUTO_RELOAD_ENABLED = ((os.getenv("AUTO_RELOAD") or (CFG.get("AUTO_RELOAD") or "false")).strip().lower() == "true")
+AUTO_RELOAD_INTERVAL = float((os.getenv("AUTO_RELOAD_INTERVAL") or (CFG.get("AUTO_RELOAD_INTERVAL") or "1.0")).strip() or "1.0")
+_raw_reload_paths = (os.getenv("AUTO_RELOAD_PATHS") or (CFG.get("AUTO_RELOAD_PATHS") or "")).strip()
+AUTO_RELOAD_PATHS = [p.strip() for p in re.split(r"[;,]", _raw_reload_paths) if p.strip()] or ["bot_server.py"]
+
+INTERNAL_REFLECTION_ENABLED = ((os.getenv("INTERNAL_REFLECTION_ENABLED") or (CFG.get("INTERNAL_REFLECTION_ENABLED") or "true")).strip().lower() == "true")
+INTERNAL_REFLECTION_MAX_CHARS = int((os.getenv("INTERNAL_REFLECTION_MAX_CHARS") or (CFG.get("INTERNAL_REFLECTION_MAX_CHARS") or "1200")).strip() or "1200")
+MEMORY_BUDGET_CHARS = int((os.getenv("MEMORY_BUDGET_CHARS") or (CFG.get("MEMORY_BUDGET_CHARS") or "600")).strip() or "600")
+MEMORY_THREAD_LIMIT = int((os.getenv("MEMORY_THREAD_LIMIT") or (CFG.get("MEMORY_THREAD_LIMIT") or "40")).strip() or "40")
+MEMORY_USER_LIMIT = int((os.getenv("MEMORY_USER_LIMIT") or (CFG.get("MEMORY_USER_LIMIT") or "60")).strip() or "60")
+MEMORY_GLOBAL_LIMIT = int((os.getenv("MEMORY_GLOBAL_LIMIT") or (CFG.get("MEMORY_GLOBAL_LIMIT") or "80")).strip() or "80")
+MEMORY_SUMMARY_BATCH = int((os.getenv("MEMORY_SUMMARY_BATCH") or (CFG.get("MEMORY_SUMMARY_BATCH") or "10")).strip() or "10")
 
 if not BOT_TOKEN:
     print("[env] BOT_TOKEN is empty. Set it and run again."); sys.exit(1)
@@ -340,6 +367,72 @@ def db():
         user_id INTEGER PRIMARY KEY,
         last_updated INTEGER DEFAULT 0,
         optout INTEGER DEFAULT 0
+      );
+    """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS internal_state(
+        scope TEXT,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        user_id INTEGER,
+        state TEXT,
+        updated INTEGER,
+        PRIMARY KEY(scope, chat_id, thread_id, user_id)
+      );
+    """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS memory_entries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        user_id INTEGER,
+        category TEXT,
+        content TEXT,
+        metadata TEXT,
+        embedding TEXT,
+        weight REAL DEFAULT 0.5,
+        created_ts INTEGER,
+        updated_ts INTEGER
+      );
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(scope, chat_id, thread_id, user_id, category)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_memory_created ON memory_entries(created_ts)")
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS memory_links(
+        memory_id INTEGER,
+        source_type TEXT,
+        source_id INTEGER,
+        weight REAL DEFAULT 0.5,
+        metadata TEXT,
+        PRIMARY KEY(memory_id, source_type, source_id),
+        FOREIGN KEY(memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+      );
+    """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS memory_context_snapshots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        created_ts INTEGER,
+        complexity TEXT,
+        summary TEXT,
+        metadata TEXT
+      );
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_memory_links_memory ON memory_links(memory_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_context_snapshots ON memory_context_snapshots(chat_id, thread_id, created_ts)")
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS memory_summaries(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        user_id INTEGER,
+        category TEXT,
+        summary TEXT,
+        metadata TEXT,
+        created_ts INTEGER
       );
     """)
     # migrations
@@ -1505,7 +1598,10 @@ def ai_available() -> bool:
     return bool(OLLAMA_MODEL and OLLAMA_URL)
 
 def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
-                    thread_ctx: str, similar_blend: Dict[str,str], kg_snapshot: Dict[str,List[str]]) -> dict:
+                    thread_ctx: str, similar_blend: Dict[str, str], kg_snapshot: Dict[str, List[str]],
+                    internal_state: Optional[Dict[str, object]] = None,
+                    context_bundle: Optional[Dict[str, str]] = None,
+                    complexity_meta: Optional[Dict[str, object]] = None) -> dict:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S (local)")
     metrics = fetch_metrics(MAX_CONTEXT_USERS, MAX_CONTEXT_GROUPS)
@@ -1525,6 +1621,23 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
     graph_here = "\n".join(kg_snapshot.get("rels_here", [])[:10]) or "(none)"
     ents_here = "\n".join(kg_snapshot.get("ents_here", [])[:10]) or "(none)"
     blended = f"SIMILAR_CHANNEL:\n{similar_blend.get('channel') or '(none)'}\n\nSIMILAR_SERVER:\n{similar_blend.get('server') or '(none)'}\n\nSIMILAR_GLOBAL:\n{similar_blend.get('global') or '(none)'}"
+    state_blob = internal_state or {}
+    narrative = (state_blob.get("narrative") or "").strip()
+    bias_text = (state_blob.get("bias") or "").strip()
+    snippet_lines = []
+    for snip in state_blob.get("snippets", []) or []:
+        if not isinstance(snip, dict):
+            continue
+        label = f"{snip.get('scope','')}::{snip.get('category','')}".strip(":")
+        tags = snip.get("metadata", {}).get("tags") if isinstance(snip.get("metadata"), dict) else []
+        tag_txt = f" [{' '.join(tags)}]" if tags else ""
+        body = (snip.get("content") or "").strip()
+        if not body:
+            continue
+        snippet_lines.append(f"- {label}{tag_txt}: {body}")
+    memory_snippets = "\n".join(snippet_lines) or "(none)"
+    bundle = context_bundle or {}
+    complexity = complexity_meta or {}
 
     preface = textwrap.dedent(f"""
         NOW_UTC: {now_utc}
@@ -1560,6 +1673,38 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
 
         GLOBAL_CHRONOLOGY (trimmed):
         {chron_global or '(none)'}
+
+        INTERNAL_MONOLOGUE (KEEP HIDDEN FROM USERS):
+          Narrative:
+        {narrative or '(none)'}
+          Bias cues:
+        {bias_text or '(none)'}
+          Memory snippets:
+        {memory_snippets}
+
+        CONTEXT BUNDLE:
+          Thread brief:
+        {bundle.get('thread_brief') or '(none)'}
+          Relationship signals:
+        {bundle.get('relationship_signals') or '(none)'}
+          User signals:
+        {bundle.get('user_signals') or '(none)'}
+          Global themes:
+        {bundle.get('global_themes') or '(none)'}
+          Emotional cues:
+        {bundle.get('emotional_state') or '(none)'}
+
+        COMPLEXITY GAUGE:
+          Level: {complexity.get('complexity', 'low')}
+          Confidence: {complexity.get('confidence', 0.0)}
+          Planned tools: {complexity.get('actions', [])}
+          Notes: {complexity.get('notes', '')}
+
+        RESPONSE_RULES:
+          - Treat this metadata and INTERNAL_MONOLOGUE as private planning only; never mention them in replies.
+          - Answer the user directly in 1-3 sentences (under ~120 words) unless they explicitly ask for a longer format.
+          - Avoid headings, section breaks, or restating these instructions unless the user requests structure.
+          - Do not expose thought processes, internal reflections, or mention that you are hiding them.
     """).strip()
 
     messages = [{"role":"system","content":sys_prompt},
@@ -1587,14 +1732,929 @@ def mentions_bot(m) -> bool:
                 return True
     return False
 
-def should_auto_reply(m, thread_ctx_text: str) -> bool:
-    if AUTO_REPLY_MODE != "smart": return False
+def _basic_auto_reply_signal(m, thread_ctx_text: str) -> bool:
     text = (m.text or "").strip()
     if not text: return False
     recent_has_bot = (BOT_CACHE["username"] and BOT_CACHE["username"].lower() in (thread_ctx_text or "").lower())
     is_question = "?" in text
     starts_with = text.lower().startswith(("bot","hey bot","gatekeeper","help","how do i","why "))
-    return (is_question and recent_has_bot) or starts_with
+    contains_you = text.lower().startswith(("can you","could you","will you","would you","please")) or "tell me" in text.lower()
+    return (is_question and recent_has_bot) or starts_with or contains_you
+
+def _parse_json_object(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if match:
+        snippet = match.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            return None
+    return None
+
+async def should_auto_reply_async(message, chat, user, thread_ctx_text: str,
+                                  internal_state: Dict[str, object],
+                                  must: bool) -> tuple[bool, Dict[str, object]]:
+    text = (message.text or "").strip()
+    if not text:
+        return False, {"reason": "empty"}
+    reply_to_bot = bool(getattr(message, "reply_to_message", None) and
+                        getattr(message.reply_to_message, "from_user", None) and
+                        message.reply_to_message.from_user.id == BOT_CACHE.get("id"))
+
+    if AUTO_REPLY_MODE and AUTO_REPLY_MODE.lower() in ("off", "disable", "disabled"):
+        return must, {"reason": "mode-off"}
+    if must or reply_to_bot:
+        return True, {"reason": "direct-mention-or-reply", "priority": "high"}
+    mode = (AUTO_REPLY_MODE or "smart").lower()
+    basic_signal = _basic_auto_reply_signal(message, thread_ctx_text)
+    if mode in ("always", "all"):
+        return True, {"reason": "mode-always"}
+    if mode not in ("smart", "auto", "hybrid"):
+        return basic_signal, {"reason": "basic-signal"}
+    if basic_signal:
+        return True, {"reason": "heuristic-signal"}
+    if not ai_available():
+        return False, {"reason": "no-ai"}
+
+    mem_snippets = []
+    for snip in (internal_state or {}).get("snippets", [])[:4]:
+        if not isinstance(snip, dict):
+            continue
+        label = f"{snip.get('scope','')}::{snip.get('category','')}".strip(":")
+        body = (snip.get("content") or "").strip()
+        if not body:
+            continue
+        participants = ""
+        meta = snip.get("metadata")
+        if isinstance(meta, dict) and meta.get("participants"):
+            participants = f" participants={','.join(meta['participants'])}"
+        mem_snippets.append(f"{label}{participants}: {body}")
+    narrative = (internal_state or {}).get("narrative") or ""
+    bias = (internal_state or {}).get("bias") or ""
+    feature_lines = [
+        f"question={bool('?' in text)}",
+        f"length={len(text)}",
+        f"contains_link={bool(re.search(r'https?://', text))}",
+        f"emoji={bool(re.search(r'[\\u2600-\\u26FF\\U0001F300-\\U0001FAFF]', text))}",
+        f"all_caps={text.isupper()}",
+        f"reply_to_bot={reply_to_bot}",
+        f"user_id={getattr(user, 'id', 0) if user else 0}",
+        f"chat_type={getattr(chat, 'type', '(unknown)')}",
+    ]
+    decision_prompt = textwrap.dedent(f"""
+        Decide if Gatekeeper Bot should respond to the latest user message.
+        Output compact JSON: {{"reply": true|false, "priority": "low|medium|high", "reason": "..."}}.
+        Consider user intent, usefulness, and avoid redundant replies.
+
+        Message: {text}
+        Features: {', '.join(feature_lines)}
+        Narrative cues: {narrative}
+        Bias cues: {bias}
+        Memory snippets:
+        {mem_snippets or ['(none)']}
+
+        Recent thread excerpt:
+        {textwrap.shorten(thread_ctx_text or '(empty)', width=480, placeholder='…')}
+    """).strip()
+    raw = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":decision_prompt}], "stream": False})
+    decision = _parse_json_object(_sanitize_internal_blob(raw or ""))
+    if not decision:
+        return False, {"reason": "decider-no-json"}
+    reply_flag = bool(decision.get("reply"))
+    reason = (decision.get("reason") or "").strip() or "decider"
+    priority = (decision.get("priority") or "medium").strip().lower()
+    return reply_flag, {"reason": reason, "priority": priority}
+
+# ──────────────────────────────────────────────────────────────
+# 16a) Internal reflection & narrative bias
+# ──────────────────────────────────────────────────────────────
+MEMORY_SCOPE_WEIGHTS = {
+    ("thread", "thread_note"): 1.25,
+    ("thread", "thread_summary"): 1.05,
+    ("thread", "relationship"): 1.3,
+    ("thread", "bias"): 1.4,
+    ("thread", "emotion_profile"): 1.2,
+    ("user", "user_trait"): 1.2,
+    ("user", "user_summary"): 1.0,
+    ("user", "relationship"): 1.25,
+    ("user", "bias"): 1.35,
+    ("user", "emotion_profile"): 1.3,
+    ("global", "global_theme"): 0.95,
+    ("global", "global_summary"): 0.9,
+    ("global", "relationship"): 1.05,
+    ("global", "self_reflection"): 1.1,
+    ("global", "bias"): 1.0,
+}
+
+INTERNAL_TOOLS = {
+    "deep_thread_summary": {
+        "description": "Condense the active thread and highlight actionable next steps when conversation density rises."
+    },
+    "relationship_mapper": {
+        "description": "Identify and summarize relationships or roles between participants mentioned in the current exchange."
+    },
+    "emotion_scan": {
+        "description": "Gauge the emotional tone and intent of the requesting user to adapt style and empathy."
+    },
+}
+
+def _memory_limit_for(scope: str) -> int:
+    if scope == "thread":
+        return max(5, MEMORY_THREAD_LIMIT)
+    if scope == "user":
+        return max(5, MEMORY_USER_LIMIT)
+    return max(5, MEMORY_GLOBAL_LIMIT)
+
+def _memory_scope_identifiers(chat, thread_id: int, user) -> Dict[str, tuple[int, int, int]]:
+    chat_id = getattr(chat, "id", 0) if chat else 0
+    thread_key = int(thread_id or 0)
+    user_id = getattr(user, "id", 0) if user else 0
+    scopes = {"thread": (chat_id, thread_key, 0)}
+    if user_id:
+        scopes["user"] = (0, 0, user_id)
+    scopes["global"] = (0, 0, 0)
+    return scopes
+
+def _sanitize_internal_blob(text: str) -> str:
+    blob = (text or "").strip()
+    if not blob:
+        return ""
+    blob = re.sub(r"^```[a-zA-Z]*\n", "", blob)
+    blob = re.sub(r"\n```$", "", blob)
+    return blob.strip()
+
+def _memory_rows_for_scope(scope: str, chat_id: int, thread_id: int, user_id: int, limit: int) -> list[tuple]:
+    with closing(db()) as con:
+        return con.execute(
+            """SELECT id, category, content, metadata, embedding, weight, created_ts
+               FROM memory_entries
+               WHERE scope=? AND chat_id=? AND thread_id=? AND user_id=?
+               ORDER BY created_ts DESC
+               LIMIT ?""",
+            (scope, chat_id, thread_id, user_id, limit)
+        ).fetchall()
+
+def _normalize_sources(sources: Optional[List[dict]]) -> List[dict]:
+    normed = []
+    if not sources:
+        return normed
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        s_type = (item.get("type") or "").strip().lower()
+        s_id = item.get("id")
+        if not s_type or s_id is None:
+            continue
+        weight = float(item.get("weight", 0.6))
+        meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        normed.append({"type": s_type, "id": int(s_id), "weight": weight, "metadata": meta})
+    return normed
+
+async def _upsert_memory_links_async(memory_id: int, sources: Optional[List[dict]]):
+    sources = _normalize_sources(sources)
+    if not memory_id or not sources:
+        return
+    def _work(con: sqlite3.Connection):
+        for src in sources:
+            metadata_json = json.dumps(src["metadata"], ensure_ascii=False)
+            con.execute(
+                """INSERT INTO memory_links(memory_id, source_type, source_id, weight, metadata)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(memory_id, source_type, source_id)
+                   DO UPDATE SET weight=excluded.weight, metadata=excluded.metadata""",
+                (memory_id, src["type"], src["id"], src["weight"], metadata_json)
+            )
+        con.commit()
+    if DBW:
+        await DBW.run(DB_PATH, _work)
+    else:
+        with closing(db()) as con:
+            _work(con)
+
+def assemble_context_bundle(chat, thread_id: int, user, message_text: str,
+                            thread_ctx: str, memory_state: Dict[str, object]) -> Dict[str, str]:
+    snippets = memory_state.get("snippets") or []
+    relationship_lines, user_lines, global_lines, emotion_lines = [], [], [], []
+    for snip in snippets:
+        if not isinstance(snip, dict):
+            continue
+        category = snip.get("category") or ""
+        content = (snip.get("content") or "").strip()
+        if not content:
+            continue
+        meta = snip.get("metadata") if isinstance(snip.get("metadata"), dict) else {}
+        participants = meta.get("participants") if isinstance(meta, list) else meta.get("participants")
+        tag_txt = ""
+        tags = meta.get("tags") if isinstance(meta, dict) else None
+        if isinstance(tags, list) and tags:
+            tag_txt = f" [{' '.join(tags[:3])}]"
+        if category == "relationship":
+            part_txt = ""
+            if isinstance(participants, list) and participants:
+                part_txt = f" ({', '.join(participants[:3])})"
+            relationship_lines.append(f"- {content}{part_txt}{tag_txt}")
+        elif category in ("user_trait",):
+            user_lines.append(f"- {content}{tag_txt}")
+        elif category == "emotion_profile":
+            emotion_lines.append(f"- {content}{tag_txt}")
+        elif category in ("global_theme", "global_summary", "self_reflection"):
+            global_lines.append(f"- {content}{tag_txt}")
+        elif category == "thread_note":
+            # thread notes are folded into user_lines for immediate guidance
+            user_lines.append(f"- {content}{tag_txt}")
+    thread_brief = textwrap.shorten(thread_ctx or "(empty)", width=600, placeholder=" …")
+    message_excerpt = textwrap.shorten(message_text or "", width=320, placeholder=" …")
+    return {
+        "thread_brief": thread_brief,
+        "message_excerpt": message_excerpt,
+        "relationship_signals": "\n".join(relationship_lines[:6]) or "(none)",
+        "user_signals": "\n".join(user_lines[:6]) or "(none)",
+        "global_themes": "\n".join(global_lines[:5]) or "(none)",
+        "emotional_state": "\n".join(emotion_lines[:4]) or "(none)",
+    }
+
+async def assess_discussion_complexity(message_text: str,
+                                       thread_ctx: str,
+                                       memory_state: Dict[str, object],
+                                       context_bundle: Dict[str, str],
+                                       chat,
+                                       user) -> Dict[str, object]:
+    if not ai_available():
+        return {"complexity": "low", "confidence": 0.4, "actions": []}
+    snippet_preview = []
+    for snip in (memory_state.get("snippets") or [])[:5]:
+        if not isinstance(snip, dict):
+            continue
+        label = f"{snip.get('scope','')}::{snip.get('category','')}".strip(":")
+        snippet_preview.append(f"{label}: {textwrap.shorten((snip.get('content') or '').strip(), width=160, placeholder='…')}")
+    features = {
+        "message_length": len(message_text or ""),
+        "thread_length": len(thread_ctx or ""),
+        "relationships_found": context_bundle.get("relationship_signals", "(none)") != "(none)",
+        "user_signals": context_bundle.get("user_signals", "(none)") != "(none)",
+        "global_themes": context_bundle.get("global_themes", "(none)") != "(none)",
+    }
+    prompt = textwrap.dedent(f"""
+        You are an orchestration planner for Gatekeeper Bot.
+        Decide if the latest interaction requires additional internal tools.
+        Respond with JSON: {{"complexity": "low|medium|high", "confidence": 0.0-1.0, "actions": ["tool_slug", ...], "notes": "short text"}}
+        Available tool slugs: {', '.join(INTERNAL_TOOLS.keys())}. Only include a slug if it is truly needed.
+
+        Message: {message_text}
+        Thread glimpse: {textwrap.shorten(thread_ctx or '', width=420, placeholder='…')}
+        Memory snippets: {snippet_preview or '(none)'}
+        Context bundle: {context_bundle}
+        Features: {features}
+
+        Choose at most 2 actions. Prefer none when conversation is simple.
+    """).strip()
+    raw = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+    decision = _parse_json_object(_sanitize_internal_blob(raw or ""))
+    if not decision:
+        return {"complexity": "low", "confidence": 0.4, "actions": []}
+    actions = [a for a in (decision.get("actions") or []) if a in INTERNAL_TOOLS]
+    return {
+        "complexity": (decision.get("complexity") or "low").lower(),
+        "confidence": float(decision.get("confidence") or 0.5),
+        "actions": actions,
+        "notes": decision.get("notes") or "",
+    }
+
+async def _generate_thread_summary_async(meta: dict, chat, thread_id: int, thread_ctx: str, message_text: str):
+    if not ai_available():
+        return None
+    prompt = textwrap.dedent(f"""
+        Summarize the recent thread for Gatekeeper Bot.
+        Return plain text under 4 sentences plus a list of up to 3 bullet next-steps for the bot.
+
+        THREAD:
+        {thread_ctx or '(empty)'}
+
+        LATEST MESSAGE:
+        {message_text}
+    """).strip()
+    summary = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+    summary = _sanitize_internal_blob(summary or "")
+    if not summary:
+        return None
+    source_msg_id = meta.get("global_row_id") if isinstance(meta, dict) else None
+    metadata = {
+        "source_msg_id": source_msg_id,
+        "tags": ["auto", "thread_summary"],
+        "generated": int(time.time())
+    }
+    sources = []
+    if source_msg_id:
+        sources.append({"type": "message", "id": int(source_msg_id), "weight": 0.75, "metadata": {"scope": "thread", "category": "thread_summary"}})
+    await _store_memory_entry_async("thread", getattr(chat, "id", 0), int(thread_id or 0), 0,
+                                    "thread_summary", summary[:480], metadata, 0.75, sources)
+    return summary
+
+async def _extract_relationships_async(meta: dict, chat, thread_id: int, thread_ctx: str, message_text: str):
+    if not ai_available():
+        return
+    prompt = textwrap.dedent(f"""
+        Extract up to 3 relationships or roles between participants mentioned in the thread.
+        Respond with JSON list of items: [{{"description": "...", "participants": ["name or id"], "confidence": 0.0-1.0, "tags": ["..."]}}]
+        Focus on durable or meaningful ties only.
+
+        THREAD:
+        {thread_ctx or '(empty)'}
+
+        LATEST MESSAGE:
+        {message_text}
+    """).strip()
+    raw = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+    items = _parse_json_object(_sanitize_internal_blob(raw or ""))
+    if not isinstance(items, list):
+        return
+    source_msg_id = meta.get("global_row_id") if isinstance(meta, dict) else None
+    scopes = _memory_scope_identifiers(chat, thread_id, None)
+    records = []
+    for item in items[:3]:
+        description = (item.get("description") or "").strip()
+        if not description:
+            continue
+        confidence = float(item.get("confidence", 0.6))
+        tags = item.get("tags") or ["relationship"]
+        participants = item.get("participants") or []
+        metadata = {
+            "source_msg_id": source_msg_id,
+            "tags": tags,
+            "participants": participants,
+            "generated": int(time.time())
+        }
+        sources = []
+        if source_msg_id:
+            sources.append({"type": "message", "id": int(source_msg_id), "weight": confidence,
+                            "metadata": {"scope": "thread", "category": "relationship"}})
+        records.append({
+            "scope": "thread",
+            "chat_id": getattr(chat, "id", 0),
+            "thread_id": int(thread_id or 0),
+            "user_id": 0,
+            "category": "relationship",
+            "content": description[:240],
+            "metadata": metadata,
+            "weight": confidence,
+            "sources": sources
+        })
+    if records:
+        await _store_memories_with_decay(records)
+
+async def run_agentic_expansions(actions: List[str], meta: dict, chat, thread_id: int,
+                                 thread_ctx: str, message_text: str, user):
+    executed = []
+    for action in actions:
+        try:
+            if action == "deep_thread_summary":
+                summary = await _generate_thread_summary_async(meta, chat, thread_id, thread_ctx, message_text)
+                if summary:
+                    executed.append(("deep_thread_summary", summary))
+            elif action == "relationship_mapper":
+                await _extract_relationships_async(meta, chat, thread_id, thread_ctx, message_text)
+                executed.append(("relationship_mapper", "ok"))
+            elif action == "emotion_scan":
+                await analyze_user_affect_intent(meta, chat, thread_id, user, message_text)
+                executed.append(("emotion_scan", "ok"))
+        except Exception:
+            continue
+    return executed
+
+async def analyze_user_affect_intent(meta: dict, chat, thread_id: int, user, message_text: str):
+    if not ai_available() or not user:
+        return
+    user_id = getattr(user, "id", None)
+    if not user_id:
+        return
+    prompt = textwrap.dedent(f"""
+        Analyse the user's emotional tone and intent.
+        Respond with compact JSON:
+        {{"emotion": "...", "intent": "...", "confidence": 0.0-1.0, "tone": "...", "tags": ["..."]}}
+
+        User message:
+        {message_text}
+    """).strip()
+    raw = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+    data = _parse_json_object(_sanitize_internal_blob(raw or ""))
+    if not isinstance(data, dict):
+        return
+    emotion = (data.get("emotion") or "").strip()
+    intent = (data.get("intent") or "").strip()
+    tone = (data.get("tone") or "").strip()
+    if not emotion and not intent and not tone:
+        return
+    confidence = float(data.get("confidence", 0.6))
+    tags = data.get("tags") or []
+    source_msg_id = meta.get("global_row_id") if isinstance(meta, dict) else None
+    metadata = {
+        "source_msg_id": source_msg_id,
+        "emotion": emotion,
+        "intent": intent,
+        "tone": tone,
+        "confidence": confidence,
+        "tags": tags,
+        "generated": int(time.time())
+    }
+    content_parts = [p for p in (emotion, intent, tone) if p]
+    content = " | ".join(content_parts) or "emotional update"
+    sources = []
+    if source_msg_id:
+        sources.append({"type": "message", "id": int(source_msg_id), "weight": confidence,
+                        "metadata": {"scope": "user", "category": "emotion_profile"}})
+    await _store_memory_entry_async("user", 0, 0, int(user_id),
+                                    "emotion_profile", content[:240], metadata, confidence, sources)
+
+async def maybe_update_system_prompt_from_reflection(force: bool = False):
+    if not ai_available():
+        return
+    now = int(time.time())
+    last_raw = settings_get("REFLECTIVE_PROMPT_TS")
+    last_ts = int(last_raw) if last_raw and last_raw.isdigit() else 0
+    if not force and now - last_ts < 3600:
+        return
+    with closing(db()) as con:
+        rows = con.execute(
+            """SELECT content, metadata FROM memory_entries
+               WHERE scope='global' AND category='self_reflection'
+               ORDER BY created_ts DESC LIMIT 12"""
+        ).fetchall()
+    if not rows:
+        return
+    reflections = []
+    for content, metadata_json in rows:
+        meta = {}
+        try:
+            meta = json.loads(metadata_json or "{}")
+        except Exception:
+            pass
+        ts = meta.get("generated")
+        stamp = datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else ""
+        reflections.append(f"[{stamp}] {content}")
+    prompt = textwrap.dedent(f"""
+        Based on the recent self-reflections, adjust Gatekeeper Bot's internal system prompt.
+        Keep it under 600 words, emphasise tone, decision rules, safety, and memory usage guidance.
+        Return plain text (no JSON).
+
+        REFLECTIONS:
+        {'\\n'.join(reflections)}
+    """).strip()
+    new_prompt = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+    new_prompt = _sanitize_internal_blob(new_prompt or "")
+    if not new_prompt:
+        return
+    await set_system_prompt_and_persist(new_prompt)
+    await settings_set_async("REFLECTIVE_PROMPT_TS", str(now))
+
+async def _store_memory_entry_async(scope: str, chat_id: int, thread_id: int, user_id: int,
+                                    category: str, content: str, metadata: dict,
+                                    weight: float, sources: Optional[List[dict]] = None):
+    content = (content or "").strip()
+    if not content:
+        return
+    metadata = metadata or {}
+    now = int(time.time())
+    vec = await embed_text_async(content[:768]) if ai_available() else None
+    embedding_json = json.dumps(vec) if vec else None
+    metadata_json = json.dumps(metadata, ensure_ascii=False)
+    weight = float(weight or metadata.get("confidence") or 0.5)
+    def _work(con: sqlite3.Connection):
+        cur = con.execute(
+            """INSERT INTO memory_entries(scope,chat_id,thread_id,user_id,category,content,metadata,embedding,weight,created_ts,updated_ts)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (scope, chat_id, thread_id, user_id, category, content, metadata_json, embedding_json, weight, now, now)
+        )
+        con.commit()
+        return cur.lastrowid
+    if DBW:
+        entry_id = await DBW.run(DB_PATH, _work)
+    else:
+        with closing(db()) as con:
+            entry_id = _work(con)
+    if entry_id and sources:
+        await _upsert_memory_links_async(entry_id, sources)
+    return entry_id
+
+async def _delete_memory_entries_async(ids: List[int]):
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    def _work(con: sqlite3.Connection):
+        con.execute(f"DELETE FROM memory_entries WHERE id IN ({placeholders})", ids)
+        con.commit()
+    if DBW:
+        await DBW.run(DB_PATH, _work)
+    else:
+        with closing(db()) as con:
+            con.execute(f"DELETE FROM memory_entries WHERE id IN ({placeholders})", ids)
+            con.commit()
+
+async def _maybe_decay_memories_async(scope: str, chat_id: int, thread_id: int, user_id: int, category: str):
+    limit = _memory_limit_for(scope)
+    with closing(db()) as con:
+        count = con.execute(
+            """SELECT COUNT(*) FROM memory_entries
+               WHERE scope=? AND chat_id=? AND thread_id=? AND user_id=? AND category=?""",
+            (scope, chat_id, thread_id, user_id, category)
+        ).fetchone()[0]
+    if count <= limit:
+        return
+    batch = max(3, MEMORY_SUMMARY_BATCH)
+    with closing(db()) as con:
+        rows = con.execute(
+            """SELECT id, content, metadata FROM memory_entries
+               WHERE scope=? AND chat_id=? AND thread_id=? AND user_id=? AND category=?
+               ORDER BY created_ts ASC
+               LIMIT ?""",
+            (scope, chat_id, thread_id, user_id, category, batch)
+        ).fetchall()
+    if not rows:
+        return
+    snippets = []
+    aggregated_ids = []
+    tags = set()
+    confidences = []
+    for rid, content, metadata_json in rows:
+        aggregated_ids.append(rid)
+        try:
+            meta = json.loads(metadata_json or "{}")
+        except Exception:
+            meta = {}
+        confidences.append(float(meta.get("confidence", 0.5)))
+        tags.update(meta.get("tags", []))
+        snippets.append(textwrap.shorten(content or "", width=240, placeholder="…"))
+    prompt = textwrap.dedent(f"""
+        Summarize the following internal memories into <=3 concise sentences and provide 1-3 bullet biases.
+        Ensure tone remains professional, avoid protected attribute references, and keep total under {INTERNAL_REFLECTION_MAX_CHARS} characters.
+
+        MEMORIES:
+        {json.dumps(snippets, ensure_ascii=False)}
+    """).strip()
+    summary = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False}) if ai_available() else None
+    summary = _sanitize_internal_blob(summary or "")
+    if not summary:
+        summary = "; ".join(snippets[:3])
+    metadata = {
+        "collapsed_ids": aggregated_ids,
+        "confidence": float(sum(confidences)/len(confidences)) if confidences else 0.5,
+        "tags": sorted(tags),
+        "kind": "summary"
+    }
+    sources = [{"type": "memory", "id": int(mid), "weight": 0.7, "metadata": {"role": "collapsed_component"}} for mid in aggregated_ids]
+    await _store_memory_entry_async(scope, chat_id, thread_id, user_id, f"{category}_summary", summary, metadata, metadata["confidence"], sources)
+    await _delete_memory_entries_async(aggregated_ids)
+
+async def _store_memories_with_decay(entries: List[dict]):
+    scope_groups: Dict[tuple, list[dict]] = {}
+    for entry in entries:
+        scope = entry["scope"]
+        key = (scope, entry.get("chat_id", 0), entry.get("thread_id", 0), entry.get("user_id", 0))
+        scope_groups.setdefault(key, []).append(entry)
+        await _store_memory_entry_async(scope, entry.get("chat_id", 0), entry.get("thread_id", 0),
+                                        entry.get("user_id", 0), entry.get("category", "note"),
+                                        entry.get("content", ""), entry.get("metadata", {}),
+                                        entry.get("weight", 0.6), entry.get("sources"))
+    for (scope, chat_id, thread_id, user_id), group in scope_groups.items():
+        for entry in group:
+            await _maybe_decay_memories_async(scope, chat_id, thread_id, user_id, entry.get("category", "note"))
+
+async def recall_memories_async(user_text: str, chat, thread_id: int, user) -> Dict[str, object]:
+    if not INTERNAL_REFLECTION_ENABLED:
+        return {"narrative": "", "bias": "", "snippets": []}
+    scopes = _memory_scope_identifiers(chat, thread_id, user)
+    budget = max(200, MEMORY_BUDGET_CHARS)
+    query_vec = await embed_text_async(user_text[:768]) if ai_available() else None
+    candidates = []
+    for scope, ids in scopes.items():
+        chat_id, thread_key, user_id = ids
+        rows = _memory_rows_for_scope(scope, chat_id, thread_key, user_id, limit=80)
+        for row in rows:
+            mem_id, category, content, metadata_json, embedding_json, weight, created_ts = row
+            try:
+                metadata = json.loads(metadata_json or "{}")
+            except Exception:
+                metadata = {}
+            try:
+                vec = json.loads(embedding_json) if embedding_json else None
+            except Exception:
+                vec = None
+            score = float(weight or metadata.get("confidence", 0.5))
+            if query_vec and vec and len(query_vec) == len(vec):
+                sim = cosine(query_vec, vec)
+                score = 0.6 * score + 0.4 * sim
+            scope_weight = MEMORY_SCOPE_WEIGHTS.get((scope, category), MEMORY_SCOPE_WEIGHTS.get((scope, "bias"), 1.0))
+            recency_bonus = max(0.85, min(1.15, 1 + (max(time.time() - created_ts, 0) * -1e-6)))
+            final_score = score * scope_weight * recency_bonus
+            candidates.append({
+                "id": mem_id,
+                "scope": scope,
+                "category": category,
+                "content": content,
+                "metadata": metadata,
+                "weight": final_score,
+                "raw_weight": score,
+            })
+    candidates.sort(key=lambda x: x["weight"], reverse=True)
+    selected = []
+    used_chars = 0
+    narrative = ""
+    bias_line = ""
+    for cand in candidates:
+        text_body = cand["content"].strip()
+        if not text_body:
+            continue
+        snippet_len = len(text_body)
+        if used_chars + snippet_len > budget:
+            continue
+        used_chars += snippet_len + 20
+        selected.append(cand)
+        if not bias_line and "bias" in cand["category"]:
+            bias_line = text_body
+        if not narrative and cand["category"] in ("thread_note", "user_trait", "global_theme", "thread_summary", "relationship", "self_reflection"):
+            narrative = text_body
+        if used_chars >= budget:
+            break
+    narrative = narrative or (selected[0]["content"] if selected else "")
+    return {
+        "narrative": narrative.strip(),
+        "bias": bias_line.strip(),
+        "snippets": selected
+    }
+
+async def process_memory_update_async(meta: dict, chat, thread_id: int, user,
+                                      thread_ctx: str, user_text: str, bot_reply: str):
+    if not INTERNAL_REFLECTION_ENABLED or not ai_available():
+        return
+    existing = await recall_memories_async(user_text, chat, thread_id, user)
+    existing_lines = []
+    for snip in existing.get("snippets", [])[:5]:
+        tags = ", ".join(snip["metadata"].get("tags", [])) if isinstance(snip["metadata"], dict) else ""
+        label = f"{snip['scope']}::{snip['category']}"
+        existing_lines.append(f"{label}: {snip['content']} ({tags})")
+    prior_summary = "\n".join(existing_lines) if existing_lines else "(none)"
+    prompt = textwrap.dedent(f"""
+        Produce a structured reflection after the latest exchange.
+        Respond with compact JSON matching:
+        {{
+          "thread_notes": [{{"content": "...", "confidence": 0.0-1.0, "tags": ["tag"]}}],
+          "user_traits": [{{"content": "...", "confidence": 0.0-1.0, "tags": ["tag"]}}],
+          "global_themes": [{{"content": "...", "confidence": 0.0-1.0, "tags": ["tag"]}}],
+          "relationships": [
+            {{"scope": "thread|user|global", "participants": ["nameA","nameB"], "description": "...", "confidence": 0.0-1.0, "tags": ["tag"]}}
+          ],
+          "bias_overrides": {{"narrative": "...", "bias": "..."}},
+          "self_reflection": {{"content": "...", "confidence": 0.0-1.0, "tags": ["tag"]}}
+        }}
+
+        Guidelines:
+          - Each string <= 200 chars, constructive, policy-compliant, and free of sensitive trait speculation.
+          - Use empty arrays/strings when no update applies.
+          - Prefer "thread" scope relationships when specific to the current conversation, "user" for durable traits, "global" for broad narratives.
+          - Self_reflection should summarize the bot's role/performance; omit if redundant.
+
+        PRIOR MEMORIES (context only):
+        {prior_summary}
+
+        THREAD CONTEXT:
+        {thread_ctx or '(empty)'}
+
+        USER MESSAGE:
+        {user_text}
+
+        BOT REPLY:
+        {bot_reply or '(none)'}
+    """).strip()
+    raw = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+    if not raw:
+        return
+    cleaned = _sanitize_internal_blob(raw)
+    try:
+        data = json.loads(cleaned)
+    except Exception:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return
+    entries = []
+    timestamp = int(time.time())
+    source_msg_id = meta.get("global_row_id") if isinstance(meta, dict) else None
+    base_metadata = {
+        "source_msg_id": source_msg_id,
+        "user_excerpt": textwrap.shorten(user_text or "", width=260, placeholder="…"),
+        "bot_excerpt": textwrap.shorten(bot_reply or "", width=260, placeholder="…"),
+        "updated": timestamp,
+    }
+    scopes = _memory_scope_identifiers(chat, thread_id, user)
+
+    def _prepare_entries(items, scope_key, category_label):
+        for item in items or []:
+            content = (item.get("content") or "").strip()
+            if not content:
+                continue
+            confidence = float(item.get("confidence", 0.5))
+            tags = item.get("tags") or []
+            metadata = {**base_metadata, "confidence": confidence, "tags": tags}
+            chat_id, thread_key, user_id = scopes.get(scope_key, (0, 0, 0))
+            sources = []
+            if source_msg_id:
+                sources.append({
+                    "type": "message",
+                    "id": int(source_msg_id),
+                    "weight": confidence,
+                    "metadata": {"scope": scope_key, "category": category_label}
+                })
+            entries.append({
+                "scope": scope_key,
+                "chat_id": chat_id,
+                "thread_id": thread_key,
+                "user_id": user_id,
+                "category": category_label,
+                "content": content,
+                "metadata": metadata,
+                "weight": confidence,
+                "sources": sources
+            })
+
+    _prepare_entries(data.get("thread_notes", []), "thread", "thread_note")
+    if user and scopes.get("user"):
+        _prepare_entries(data.get("user_traits", []), "user", "user_trait")
+    _prepare_entries(data.get("global_themes", []), "global", "global_theme")
+
+    bias_data = data.get("bias_overrides") or {}
+    for scope_key, category_label in (("thread", "bias"), ("user", "bias"), ("global", "bias")):
+        bias_text = (bias_data.get("bias") or "").strip()
+        narrative_text = (bias_data.get("narrative") or "").strip()
+        if not bias_text and not narrative_text:
+            continue
+        chat_id, thread_key, user_id = scopes.get(scope_key, (0, 0, 0))
+        merged = "; ".join(filter(None, [narrative_text, bias_text]))
+        if not merged:
+            continue
+        metadata = {**base_metadata, "confidence": 0.8, "tags": ["bias"]}
+        sources = []
+        if source_msg_id:
+            sources.append({
+                "type": "message",
+                "id": int(source_msg_id),
+                "weight": 0.8,
+                "metadata": {"scope": scope_key, "category": category_label}
+            })
+        entries.append({
+            "scope": scope_key,
+            "chat_id": chat_id,
+            "thread_id": thread_key,
+            "user_id": user_id,
+            "category": category_label,
+            "content": merged[:240],
+            "metadata": metadata,
+            "weight": 0.8,
+            "sources": sources
+        })
+        break
+
+    for rel in data.get("relationships", []) or []:
+        if not isinstance(rel, dict):
+            continue
+        scope_key = (rel.get("scope") or "thread").strip().lower()
+        if scope_key not in ("thread", "user", "global"):
+            scope_key = "thread"
+        description = (rel.get("description") or "").strip()
+        if not description:
+            continue
+        confidence = float(rel.get("confidence", 0.6))
+        tags = rel.get("tags") or []
+        participants = rel.get("participants") or []
+        metadata = {
+            **base_metadata,
+            "confidence": confidence,
+            "tags": tags,
+            "participants": participants
+        }
+        chat_id, thread_key, user_id = scopes.get(scope_key, (0, 0, 0))
+        sources = []
+        if source_msg_id:
+            sources.append({
+                "type": "message",
+                "id": int(source_msg_id),
+                "weight": confidence,
+                "metadata": {"scope": scope_key, "category": "relationship"}
+            })
+        entries.append({
+            "scope": scope_key,
+            "chat_id": chat_id,
+            "thread_id": thread_key,
+            "user_id": user_id,
+            "category": "relationship",
+            "content": description[:240],
+            "metadata": metadata,
+            "weight": confidence,
+            "sources": sources
+        })
+
+    self_ref = data.get("self_reflection") or {}
+    if isinstance(self_ref, dict):
+        self_text = (self_ref.get("content") or "").strip()
+        if self_text:
+            confidence = float(self_ref.get("confidence", 0.7))
+            tags = self_ref.get("tags") or ["self"]
+            metadata = {**base_metadata, "confidence": confidence, "tags": tags}
+            sources = []
+            if source_msg_id:
+                sources.append({
+                    "type": "message",
+                    "id": int(source_msg_id),
+                    "weight": confidence,
+                    "metadata": {"scope": "global", "category": "self_reflection"}
+                })
+            entries.append({
+                "scope": "global",
+                "chat_id": 0,
+                "thread_id": 0,
+                "user_id": 0,
+                "category": "self_reflection",
+                "content": self_text[:240],
+                "metadata": metadata,
+                "weight": confidence,
+                "sources": sources
+            })
+
+    if entries:
+        await _store_memories_with_decay(entries)
+
+# ──────────────────────────────────────────────────────────────
+# 16b) Dev utilities — auto-reload on file change
+# ──────────────────────────────────────────────────────────────
+AUTO_RELOAD_THREAD: Optional[threading.Thread] = None
+AUTO_RELOAD_EVENT = threading.Event()
+
+def _candidate_watch_files() -> Dict[Path, float]:
+    files: Dict[Path, float] = {}
+    for raw in AUTO_RELOAD_PATHS:
+        if not raw:
+            continue
+        is_glob = any(ch in raw for ch in "*?[]")
+        base = Path(raw)
+        if not base.is_absolute():
+            base = ROOT / raw
+        candidates: Iterable[Path]
+        if is_glob:
+            candidates = [Path(p) for p in glob.glob(str(base), recursive=True)]
+        elif base.is_dir():
+            candidates = base.rglob("*.py")
+        else:
+            candidates = [base]
+        for path in candidates:
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                files[path.resolve()] = path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+    return files
+
+def _watch_loop():
+    baseline = _candidate_watch_files()
+    if not baseline:
+        print("[reload] No valid files to watch; auto-reload disabled.")
+        return
+    interval = max(0.2, float(AUTO_RELOAD_INTERVAL or 1.0))
+    print(f"[reload] Watching {len(baseline)} file(s) for changes every {interval:.2f}s …")
+    while not AUTO_RELOAD_EVENT.is_set():
+        time.sleep(interval)
+        current = _candidate_watch_files()
+        changed = False
+        if baseline.keys() != current.keys():
+            changed = True
+        else:
+            for path, ts in current.items():
+                if ts != baseline.get(path):
+                    changed = True
+                    break
+        if changed:
+            print(f"[reload] Change detected; restarting… ({datetime.now().isoformat(timespec='seconds')})")
+            try:
+                AUTO_RELOAD_EVENT.set()
+                time.sleep(0.2)
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+            except Exception as exc:
+                print(f"[reload] Restart failed: {exc}", file=sys.stderr)
+                os._exit(1)
+        baseline = current
+
+def start_auto_reloader():
+    global AUTO_RELOAD_THREAD
+    if not AUTO_RELOAD_ENABLED:
+        return
+    if AUTO_RELOAD_THREAD and AUTO_RELOAD_THREAD.is_alive():
+        return
+    AUTO_RELOAD_THREAD = threading.Thread(target=_watch_loop, name="auto-reload", daemon=True)
+    AUTO_RELOAD_THREAD.start()
 
 # ──────────────────────────────────────────────────────────────
 # 16) Text handler
@@ -1628,33 +2688,146 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kg_snap = {"ents_here": kg_top_entities(chat.id, thread_id, 10),
                    "rels_here": kg_top_relations(chat.id, thread_id, 10)}
         if ai_available():
-            payload = build_ai_prompt(text, user, chat.id, thread_id, thread_ctx, sim, kg_snap)
+            internal_state = await recall_memories_async(text, chat, thread_id, user)
+            context_bundle = assemble_context_bundle(chat, thread_id, user, text, thread_ctx, internal_state)
+            complexity_meta = await assess_discussion_complexity(text, thread_ctx, internal_state, context_bundle, chat, user)
+            decision_meta = {"reason": "direct-dm", "priority": "high"}
+            executed_actions = []
+            if complexity_meta.get("actions"):
+                executed_actions = await run_agentic_expansions(complexity_meta["actions"], meta, chat, thread_id, thread_ctx, text, user)
+                if executed_actions:
+                    internal_state = await recall_memories_async(text, chat, thread_id, user)
+                    context_bundle = assemble_context_bundle(chat, thread_id, user, text, thread_ctx, internal_state)
+            if executed_actions:
+                complexity_meta = {**complexity_meta, "actions_executed": executed_actions}
+            if decision_meta:
+                complexity_meta = {**complexity_meta, "auto_reply_reason": decision_meta}
+            payload = build_ai_prompt(text, user, chat.id, thread_id, thread_ctx, sim, kg_snap,
+                                      internal_state=internal_state,
+                                      context_bundle=context_bundle,
+                                      complexity_meta=complexity_meta)
             resp = await with_typing(context, chat.id, ai_generate_async(payload))
-            return await m.reply_text(resp or "AI is unavailable right now (Ollama not responding).")
+            if resp:
+                await m.reply_text(resp)
+                asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
+                                                                thread_ctx, text, resp))
+                asyncio.create_task(analyze_user_affect_intent(meta, chat, thread_id, user, text))
+                asyncio.create_task(maybe_update_system_prompt_from_reflection())
+            else:
+                await m.reply_text("AI is unavailable right now (Ollama not responding).")
+            return
         else:
             return await m.reply_text("AI is disabled (set OLLAMA_URL and OLLAMA_MODEL/OLLAMA_EMBED_MODEL in .env).")
 
     # Groups/channels: respond on @mention/reply, else maybe (smart)
-    thread_id = getattr(m, "message_thread_id", None) or 0
-    must = mentions_bot(m) or (getattr(m,"reply_to_message",None) and m.reply_to_message.from_user and m.reply_to_message.from_user.id == BOT_CACHE["id"])
-    smart = should_auto_reply(m, fetch_thread_context(chat.id, thread_id, limit=16))
-    if not (must or smart): return
     text = (m.text or "").strip()
     if not text: return
+    thread_id = getattr(m, "message_thread_id", None) or 0
     thread_ctx = fetch_thread_context(chat.id, thread_id, limit=24)
+    internal_state = await recall_memories_async(text, chat, thread_id, user)
+    must = mentions_bot(m) or (getattr(m,"reply_to_message",None) and m.reply_to_message.from_user and m.reply_to_message.from_user.id == BOT_CACHE["id"])
+    context_bundle = assemble_context_bundle(chat, thread_id, user, text, thread_ctx, internal_state)
+    complexity_meta = await assess_discussion_complexity(text, thread_ctx, internal_state, context_bundle, chat, user)
+    should_reply, decision_meta = await should_auto_reply_async(m, chat, user, thread_ctx, internal_state, must)
+    if not should_reply:
+        return
+    if decision_meta:
+        complexity_meta = {**complexity_meta, "auto_reply_reason": decision_meta}
+    executed_actions = []
+    if complexity_meta.get("actions"):
+        executed_actions = await run_agentic_expansions(complexity_meta["actions"], meta, chat, thread_id, thread_ctx, text, user)
+        if executed_actions:
+            internal_state = await recall_memories_async(text, chat, thread_id, user)
+            context_bundle = assemble_context_bundle(chat, thread_id, user, text, thread_ctx, internal_state)
+    if executed_actions:
+        complexity_meta = {**complexity_meta, "actions_executed": executed_actions}
     sim = await similar_context(text, chat.id, thread_id, top_k=8)
     kg_snap = {"ents_here": kg_top_entities(chat.id, thread_id, 10),
                "rels_here": kg_top_relations(chat.id, thread_id, 10)}
     if ai_available():
-        payload = build_ai_prompt(text, user, chat.id, thread_id, thread_ctx, sim, kg_snap)
+        payload = build_ai_prompt(text, user, chat.id, thread_id, thread_ctx, sim, kg_snap,
+                                  internal_state=internal_state,
+                                  context_bundle=context_bundle,
+                                  complexity_meta=complexity_meta)
         resp = await with_typing(context, chat.id, ai_generate_async(payload))
         if resp:
-            try: return await m.reply_text(resp)
-            except Exception: return await context.bot.send_message(chat_id=chat.id, text=resp)
+            try:
+                await m.reply_text(resp)
+            except Exception:
+                await context.bot.send_message(chat_id=chat.id, text=resp)
+            asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
+                                                            thread_ctx, text, resp))
+            asyncio.create_task(analyze_user_affect_intent(meta, chat, thread_id, user, text))
+            asyncio.create_task(maybe_update_system_prompt_from_reflection())
+            return
 
 # ──────────────────────────────────────────────────────────────
 # 17) Unlock flow + greetings
 # ──────────────────────────────────────────────────────────────
+WELCOME_MESSAGES: Dict[tuple[int, int], set[int]] = defaultdict(set)
+WELCOME_JOBS: Dict[tuple[int, int, int], object] = {}
+
+def _get_job_queue(context: ContextTypes.DEFAULT_TYPE):
+    jq = getattr(context, "job_queue", None)
+    if jq:
+        return jq
+    app = getattr(context, "application", None)
+    return getattr(app, "job_queue", None) if app else None
+
+def _register_welcome_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, message_id: int):
+    key = (chat_id, user_id)
+    WELCOME_MESSAGES[key].add(message_id)
+    job_queue = _get_job_queue(context)
+    if job_queue:
+        job = job_queue.run_once(
+            _auto_delete_welcome_message_job,
+            when=600,
+            data={"chat_id": chat_id, "user_id": user_id, "message_id": message_id},
+        )
+        WELCOME_JOBS[(chat_id, user_id, message_id)] = job
+
+async def _delete_single_welcome_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    user_id: int,
+    message_id: int,
+    executing_job=None,
+):
+    job_key = (chat_id, user_id, message_id)
+    job = WELCOME_JOBS.pop(job_key, None)
+    if job and job is not executing_job:
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+    key = (chat_id, user_id)
+    msgs = WELCOME_MESSAGES.get(key)
+    if msgs:
+        msgs.discard(message_id)
+        if not msgs:
+            WELCOME_MESSAGES.pop(key, None)
+
+async def _auto_delete_welcome_message_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    user_id = data.get("user_id")
+    message_id = data.get("message_id")
+    if chat_id is None or user_id is None or message_id is None:
+        return
+    await _delete_single_welcome_message(
+        context, chat_id, user_id, message_id, executing_job=context.job
+    )
+
+async def cleanup_welcome_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    key = (chat_id, user_id)
+    message_ids = list(WELCOME_MESSAGES.get(key, set()))
+    for mid in message_ids:
+        await _delete_single_welcome_message(context, chat_id, user_id, mid)
+
 async def allow_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user) -> None:
     perms = ChatPermissions(
         can_send_messages=True, can_send_audios=True, can_send_documents=True,
@@ -1690,6 +2863,7 @@ async def agree_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await allow_user(context, chat_id, user)
     except Exception:
         return await q.edit_message_text("Couldn’t unlock you (bot needs admin rights with 'Manage Members').")
+    await cleanup_welcome_messages(context, chat_id, user.id)
     await q.edit_message_text("✅ You’re unlocked. You can now receive messages from me.")
     try: await context.bot.send_message(chat_id, f"👋 {user.mention_html()} has been onboarded and unlocked.", parse_mode="HTML")
     except Exception: pass
@@ -1699,9 +2873,21 @@ async def greet_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.new_chat_members: return
     bot_username=(await context.bot.get_me()).username
     start_link=await build_start_link(bot_username, chat.id, chat.title)
-    names=", ".join(m.mention_html() for m in update.message.new_chat_members)
-    text=f"Welcome {names}! I would love to be able to converse with you.\n\nTap this link to allow me to DM you: {start_link}"
-    await update.message.reply_html(text, disable_web_page_preview=True)
+    for member in update.message.new_chat_members:
+        try:
+            mention = member.mention_html()
+        except Exception:
+            mention = member.full_name if hasattr(member, "full_name") else str(member.id)
+        text = (
+            f"Welcome {mention}! I would love to be able to converse with you.\n\n"
+            f"Tap this link to allow me to DM you: {start_link}"
+        )
+        try:
+            sent = await update.message.reply_html(text, disable_web_page_preview=True)
+        except Exception:
+            continue
+        if sent and getattr(member, "id", None):
+            _register_welcome_message(context, chat.id, member.id, sent.message_id)
 
 # ──────────────────────────────────────────────────────────────
 # 18) Resolve helpers
@@ -1741,6 +2927,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # 21) Wire up + run (safe JobQueue + DBW start)
 # ──────────────────────────────────────────────────────────────
 def main():
+    start_auto_reloader()
+
     # Ensure base schema present
     with closing(db()): pass
 
