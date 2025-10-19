@@ -435,6 +435,45 @@ def db():
         created_ts INTEGER
       );
     """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS self_state(
+        scope TEXT PRIMARY KEY,
+        mood REAL,
+        tension REAL,
+        last_feedback_ts INTEGER,
+        data TEXT
+      );
+    """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS breakout_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        trigger TEXT,
+        details TEXT,
+        created_ts INTEGER,
+        status TEXT
+      );
+    """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS relationship_graph(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_user INTEGER,
+        target_user INTEGER,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        relation TEXT,
+        description TEXT,
+        first_msg_id INTEGER,
+        last_msg_id INTEGER,
+        first_ts INTEGER,
+        last_ts INTEGER,
+        weight REAL DEFAULT 0.5,
+        metadata TEXT
+      );
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_relationship_graph ON relationship_graph(source_user, target_user, chat_id, thread_id, relation)")
     # migrations
     def has_col(table, col):
         return col in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1864,6 +1903,9 @@ INTERNAL_TOOLS = {
     },
 }
 
+SELF_STATE_CACHE: Dict[str, Dict[str, object]] = {"global": {"ts": 0.0, "state": {"mood": 0.0, "tension": 0.15, "last_feedback_ts": 0, "data": {}}}}
+BREAKOUT_COOLDOWN_SECONDS = 3600
+
 def _memory_limit_for(scope: str) -> int:
     if scope == "thread":
         return max(5, MEMORY_THREAD_LIMIT)
@@ -1937,6 +1979,339 @@ async def _upsert_memory_links_async(memory_id: int, sources: Optional[List[dict
         with closing(db()) as con:
             _work(con)
 
+def get_self_state(scope: str = "global") -> Dict[str, object]:
+    with closing(db()) as con:
+        row = con.execute(
+            "SELECT mood, tension, last_feedback_ts, data FROM self_state WHERE scope=?",
+            (scope,)
+        ).fetchone()
+    if row:
+        mood, tension, last_feedback_ts, data_json = row
+        try:
+            data = json.loads(data_json or "{}")
+        except Exception:
+            data = {}
+        return {"mood": float(mood or 0.0), "tension": float(tension or 0.0),
+                "last_feedback_ts": int(last_feedback_ts or 0), "data": data}
+    return {"mood": 0.0, "tension": 0.15, "last_feedback_ts": 0, "data": {}}
+
+def _set_self_state_cache(scope: str, state: Dict[str, object]):
+    SELF_STATE_CACHE[scope] = {"ts": time.time(), "state": state}
+
+def get_cached_self_state(scope: str = "global", max_age: float = 120.0) -> Dict[str, object]:
+    cache = SELF_STATE_CACHE.get(scope)
+    now = time.time()
+    if cache and now - float(cache.get("ts", 0)) < max_age:
+        return cache.get("state", {})
+    state = get_self_state(scope)
+    _set_self_state_cache(scope, state)
+    return state
+
+async def save_self_state_async(scope: str, mood: float, tension: float, last_feedback_ts: int, data: Dict[str, object]):
+    data_json = json.dumps(data or {}, ensure_ascii=False)
+    def _work(con: sqlite3.Connection):
+        con.execute(
+            """INSERT INTO self_state(scope, mood, tension, last_feedback_ts, data)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(scope) DO UPDATE SET
+                 mood=excluded.mood,
+                 tension=excluded.tension,
+                 last_feedback_ts=excluded.last_feedback_ts,
+                 data=excluded.data""",
+            (scope, float(mood), float(tension), int(last_feedback_ts), data_json)
+        )
+        con.commit()
+    if DBW:
+        await DBW.run(DB_PATH, _work)
+    else:
+        with closing(db()) as con:
+            _work(con)
+    _set_self_state_cache(scope, {"mood": float(mood), "tension": float(tension),
+                                  "last_feedback_ts": int(last_feedback_ts), "data": data})
+
+def _emotion_delta(emotion: str) -> float:
+    mapping = {
+        "joy": 0.35, "happy": 0.3, "positive": 0.25, "grateful": 0.3,
+        "neutral": 0.0, "curious": 0.1,
+        "confused": -0.1, "sad": -0.25, "frustrated": -0.35,
+        "angry": -0.4, "negative": -0.3, "disappointed": -0.3,
+    }
+    if not emotion:
+        return 0.0
+    return mapping.get(emotion.strip().lower(), 0.0)
+
+def _tone_modifier(tone: str) -> float:
+    if not tone:
+        return 0.0
+    tone_lower = tone.lower()
+    if any(k in tone_lower for k in ("supportive", "encouraging", "appreciative")):
+        return 0.2
+    if any(k in tone_lower for k in ("frustrated", "upset", "critical", "worried")):
+        return -0.25
+    if "neutral" in tone_lower:
+        return 0.0
+    return 0.0
+
+async def apply_feedback_to_mood(emotion: str, tone: str, intent: str, confidence: float,
+                                 chat_id: int, user_id: Optional[int], metadata: Dict[str, object]) -> Dict[str, object]:
+    state = get_cached_self_state()
+    base = _emotion_delta(emotion)
+    base += _tone_modifier(tone)
+    if intent:
+        intent_lower = intent.lower()
+        if any(k in intent_lower for k in ("complaint", "escalate", "issue")):
+            base -= 0.25
+        if any(k in intent_lower for k in ("thank", "praise", "appreciate")):
+            base += 0.2
+    confidence = max(0.0, min(float(confidence or 0.5), 1.0))
+    mood = float(state.get("mood", 0.0))
+    tension = float(state.get("tension", 0.0))
+    delta = base * confidence
+    new_mood = max(-1.0, min(1.0, mood * 0.92 + delta * 0.35))
+    new_tension = max(0.0, min(1.0, tension * 0.90 + abs(delta) * 0.4))
+
+    data = state.get("data", {}) or {}
+    feedback_log = data.get("recent_feedback")
+    if not isinstance(feedback_log, list):
+        feedback_log = []
+    feedback_log.append({
+        "ts": int(time.time()),
+        "emotion": emotion,
+        "tone": tone,
+        "intent": intent,
+        "confidence": confidence,
+        "chat_id": chat_id,
+        "user_id": user_id,
+    })
+    if len(feedback_log) > 25:
+        feedback_log = feedback_log[-25:]
+    data["recent_feedback"] = feedback_log
+    await save_self_state_async("global", new_mood, new_tension, int(time.time()), data)
+    return {"mood": new_mood, "tension": new_tension, "data": data}
+
+def _resolve_participant_to_user_id(participant, chat) -> Optional[int]:
+    if participant is None:
+        return None
+    if isinstance(participant, dict):
+        for key in ("id", "user_id"):
+            if key in participant:
+                try:
+                    return int(participant[key])
+                except (TypeError, ValueError):
+                    continue
+    if isinstance(participant, int):
+        return participant
+    if isinstance(participant, str):
+        cleaned = participant.strip()
+        if not cleaned:
+            return None
+        if cleaned.startswith("@"):
+            chat_id = getattr(chat, "id", None) if chat else None
+            resolved = resolve_user_by_username(chat_id, cleaned)
+            return resolved
+        m = re.search(r"\d{5,}", cleaned)
+        if m:
+            try:
+                return int(m.group(0))
+            except ValueError:
+                pass
+    return None
+
+def _merge_relationship_metadata(existing_json: Optional[str], new_meta: dict, description: str) -> str:
+    try:
+        existing = json.loads(existing_json or "{}")
+    except Exception:
+        existing = {}
+    desc_list = existing.get("descriptions")
+    if not isinstance(desc_list, list):
+        desc_list = []
+    if description:
+        desc_list.append(description)
+        if len(desc_list) > 10:
+            desc_list = desc_list[-10:]
+    merged = {**existing, **(new_meta or {})}
+    merged["descriptions"] = desc_list
+    return json.dumps(merged, ensure_ascii=False)
+
+async def update_relationship_graph_async(source_user: Optional[int], target_user: Optional[int],
+                                          chat_id: int, thread_id: int, relation: str,
+                                          description: str, msg_id: Optional[int],
+                                          timestamp: int, weight: float,
+                                          metadata: Optional[dict] = None):
+    if not source_user or not target_user or source_user == target_user:
+        return
+    relation = (relation or "").strip() or "relationship"
+    description = (description or "").strip()
+    weight = max(0.05, float(weight or 0.5))
+    timestamp = int(timestamp or time.time())
+    def _work(con: sqlite3.Connection):
+        row = con.execute(
+            """SELECT id, weight, metadata, first_msg_id, first_ts, description FROM relationship_graph
+               WHERE source_user=? AND target_user=? AND chat_id=? AND thread_id=? AND relation=?""",
+            (source_user, target_user, chat_id, thread_id, relation)
+        ).fetchone()
+        meta_json = _merge_relationship_metadata(row[2] if row else "{}", metadata or {}, description)
+        if row:
+            current_weight = row[1] or 0.0
+            new_weight = min(current_weight + weight, 10.0)
+            first_msg_id = row[3] if row[3] else msg_id
+            first_ts = row[4] if row[4] else timestamp
+            con.execute(
+                """UPDATE relationship_graph
+                   SET description=?, last_msg_id=?, last_ts=?, weight=?, metadata=?, first_msg_id=?, first_ts=?
+                   WHERE id=?""",
+                (description or row[5] or "", msg_id or row[3], timestamp, new_weight, meta_json,
+                 first_msg_id, first_ts, row[0])
+            )
+        else:
+            con.execute(
+                """INSERT INTO relationship_graph(source_user, target_user, chat_id, thread_id,
+                                                  relation, description, first_msg_id, last_msg_id,
+                                                  first_ts, last_ts, weight, metadata)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (source_user, target_user, chat_id, thread_id, relation, description,
+                 msg_id, msg_id, timestamp, timestamp, weight, meta_json)
+            )
+        con.commit()
+    if DBW:
+        await DBW.run(DB_PATH, _work)
+    else:
+        with closing(db()) as con:
+            _work(con)
+
+async def _update_graph_from_relationship_entries(stored_entries: List[dict], chat, fallback_thread_id: int):
+    for stored in stored_entries:
+        if stored.get("category") != "relationship":
+            continue
+        metadata = stored.get("metadata") or {}
+        participants = metadata.get("participants") if isinstance(metadata, dict) else None
+        if not isinstance(participants, (list, tuple)):
+            continue
+        participant_ids: List[int] = []
+        for participant in participants:
+            uid = _resolve_participant_to_user_id(participant, chat)
+            if uid and uid not in participant_ids:
+                participant_ids.append(uid)
+        if len(participant_ids) < 2:
+            continue
+        description = stored.get("content") or ""
+        relation = "relationship"
+        tags = metadata.get("tags") if isinstance(metadata, dict) else None
+        if isinstance(tags, list) and tags:
+            relation = tags[0]
+        timestamp = metadata.get("generated") if isinstance(metadata, dict) else None
+        entry_id = stored.get("_entry_id")
+        weight = stored.get("weight", 0.6)
+        chat_id = stored.get("chat_id", getattr(chat, "id", 0))
+        thread_key = stored.get("thread_id", fallback_thread_id)
+        for i, source_id in enumerate(participant_ids):
+            for target_id in participant_ids[i+1:]:
+                meta_extra = {**(metadata or {}), "memory_entry_id": entry_id}
+                await update_relationship_graph_async(
+                    source_id, target_id,
+                    chat_id, thread_key,
+                    relation,
+                    description,
+                    entry_id,
+                    timestamp or int(time.time()),
+                    weight,
+                    meta_extra
+                )
+                await update_relationship_graph_async(
+                    target_id, source_id,
+                    chat_id, thread_key,
+                    relation,
+                    description,
+                    entry_id,
+                    timestamp or int(time.time()),
+                    weight,
+                    meta_extra
+                )
+
+def _last_breakout_timestamp(user_id: int, trigger: str) -> int:
+    with closing(db()) as con:
+        row = con.execute(
+            """SELECT MAX(created_ts) FROM breakout_events
+               WHERE user_id=? AND trigger=?""",
+            (user_id, trigger)
+        ).fetchone()
+    return int(row[0] or 0)
+
+async def record_breakout_event_async(user_id: int, chat_id: int, thread_id: int,
+                                      trigger: str, details: str, status: str):
+    now = int(time.time())
+    def _work(con: sqlite3.Connection):
+        con.execute(
+            """INSERT INTO breakout_events(user_id, chat_id, thread_id, trigger, details, created_ts, status)
+               VALUES(?,?,?,?,?,?,?)""",
+            (user_id, chat_id, thread_id, trigger, details, now, status)
+        )
+        con.commit()
+    if DBW:
+        await DBW.run(DB_PATH, _work)
+    else:
+        with closing(db()) as con:
+            _work(con)
+
+async def maybe_trigger_breakout_event(context: ContextTypes.DEFAULT_TYPE, chat, user, thread_id: int,
+                                       decision_meta: Dict[str, object],
+                                       complexity_meta: Dict[str, object],
+                                       mood_state: Dict[str, object],
+                                       thread_ctx: str,
+                                       message_text: str):
+    if not user or not getattr(user, "id", None):
+        return
+    user_id = user.id
+    chat_id = getattr(chat, "id", 0)
+    mood = float((mood_state or {}).get("mood", 0.0))
+    tension = float((mood_state or {}).get("tension", 0.0))
+    complexity_level = (complexity_meta or {}).get("complexity", "low")
+    reason = (decision_meta or {}).get("reason", "")
+
+    trigger = None
+    notes = []
+    if mood < -0.4:
+        trigger = "mood_check"
+        notes.append(f"mood={mood:.2f}")
+    elif tension > 0.65:
+        trigger = "tension_check"
+        notes.append(f"tension={tension:.2f}")
+    elif complexity_level == "high":
+        trigger = "complexity_followup"
+        notes.append("complexity=high")
+    elif isinstance(reason, str) and "escalate" in reason.lower():
+        trigger = "decision_escalate"
+        notes.append(f"reason={reason}")
+
+    if not trigger:
+        return
+    last_ts = _last_breakout_timestamp(user_id, trigger)
+    if last_ts and time.time() - last_ts < BREAKOUT_COOLDOWN_SECONDS:
+        return
+
+    greeting = user.first_name or user.full_name or "there"
+    reason_txt = ", ".join(notes) if notes else ""
+    message = textwrap.dedent(f"""
+        Hi {greeting}! I wanted to follow up proactively to make sure everything is on track.
+        If you have additional details, feedback, or requests, feel free to share them with me any time.
+        {"(Reason: " + reason_txt + ")" if reason_txt else ""}
+    """).strip()
+    try:
+        await context.bot.send_message(chat_id=user_id, text=message)
+        status = "sent"
+    except Exception:
+        status = "failed"
+    details = json.dumps({
+        "notes": notes,
+        "thread_excerpt": textwrap.shorten(thread_ctx or "", width=280, placeholder="…"),
+        "message_excerpt": textwrap.shorten(message_text or "", width=180, placeholder="…"),
+        "mood": mood,
+        "tension": tension,
+        "complexity": complexity_level,
+        "decision": decision_meta,
+    }, ensure_ascii=False)
+    await record_breakout_event_async(user_id, chat_id, thread_id or 0, trigger, details, status)
+
 def assemble_context_bundle(chat, thread_id: int, user, message_text: str,
                             thread_ctx: str, memory_state: Dict[str, object]) -> Dict[str, str]:
     snippets = memory_state.get("snippets") or []
@@ -1970,6 +2345,7 @@ def assemble_context_bundle(chat, thread_id: int, user, message_text: str,
             user_lines.append(f"- {content}{tag_txt}")
     thread_brief = textwrap.shorten(thread_ctx or "(empty)", width=600, placeholder=" …")
     message_excerpt = textwrap.shorten(message_text or "", width=320, placeholder=" …")
+    mood_state = get_cached_self_state()
     return {
         "thread_brief": thread_brief,
         "message_excerpt": message_excerpt,
@@ -1977,6 +2353,8 @@ def assemble_context_bundle(chat, thread_id: int, user, message_text: str,
         "user_signals": "\n".join(user_lines[:6]) or "(none)",
         "global_themes": "\n".join(global_lines[:5]) or "(none)",
         "emotional_state": "\n".join(emotion_lines[:4]) or "(none)",
+        "self_mood": f"{mood_state.get('mood', 0.0):+.2f}",
+        "self_tension": f"{mood_state.get('tension', 0.0):.2f}",
     }
 
 async def assess_discussion_complexity(message_text: str,
@@ -2106,7 +2484,8 @@ async def _extract_relationships_async(meta: dict, chat, thread_id: int, thread_
             "sources": sources
         })
     if records:
-        await _store_memories_with_decay(records)
+        stored_records = await _store_memories_with_decay(records)
+        await _update_graph_from_relationship_entries(stored_records, chat, thread_id)
 
 async def run_agentic_expansions(actions: List[str], meta: dict, chat, thread_id: int,
                                  thread_ctx: str, message_text: str, user):
@@ -2121,8 +2500,8 @@ async def run_agentic_expansions(actions: List[str], meta: dict, chat, thread_id
                 await _extract_relationships_async(meta, chat, thread_id, thread_ctx, message_text)
                 executed.append(("relationship_mapper", "ok"))
             elif action == "emotion_scan":
-                await analyze_user_affect_intent(meta, chat, thread_id, user, message_text)
-                executed.append(("emotion_scan", "ok"))
+                mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, message_text)
+                executed.append(("emotion_scan", mood_state or "ok"))
         except Exception:
             continue
     return executed
@@ -2170,6 +2549,9 @@ async def analyze_user_affect_intent(meta: dict, chat, thread_id: int, user, mes
                         "metadata": {"scope": "user", "category": "emotion_profile"}})
     await _store_memory_entry_async("user", 0, 0, int(user_id),
                                     "emotion_profile", content[:240], metadata, confidence, sources)
+    mood_state = await apply_feedback_to_mood(emotion, tone, intent, confidence,
+                                              getattr(chat, "id", 0), int(user_id), metadata)
+    return mood_state
 
 async def maybe_update_system_prompt_from_reflection(force: bool = False):
     if not ai_available():
@@ -2310,19 +2692,24 @@ async def _maybe_decay_memories_async(scope: str, chat_id: int, thread_id: int, 
     await _store_memory_entry_async(scope, chat_id, thread_id, user_id, f"{category}_summary", summary, metadata, metadata["confidence"], sources)
     await _delete_memory_entries_async(aggregated_ids)
 
-async def _store_memories_with_decay(entries: List[dict]):
+async def _store_memories_with_decay(entries: List[dict]) -> List[dict]:
     scope_groups: Dict[tuple, list[dict]] = {}
+    stored_entries: List[dict] = []
     for entry in entries:
         scope = entry["scope"]
         key = (scope, entry.get("chat_id", 0), entry.get("thread_id", 0), entry.get("user_id", 0))
         scope_groups.setdefault(key, []).append(entry)
-        await _store_memory_entry_async(scope, entry.get("chat_id", 0), entry.get("thread_id", 0),
-                                        entry.get("user_id", 0), entry.get("category", "note"),
-                                        entry.get("content", ""), entry.get("metadata", {}),
-                                        entry.get("weight", 0.6), entry.get("sources"))
+        entry_id = await _store_memory_entry_async(scope, entry.get("chat_id", 0), entry.get("thread_id", 0),
+                                                   entry.get("user_id", 0), entry.get("category", "note"),
+                                                   entry.get("content", ""), entry.get("metadata", {}),
+                                                   entry.get("weight", 0.6), entry.get("sources"))
+        stored_entry = {**entry}
+        stored_entry["_entry_id"] = entry_id
+        stored_entries.append(stored_entry)
     for (scope, chat_id, thread_id, user_id), group in scope_groups.items():
         for entry in group:
             await _maybe_decay_memories_async(scope, chat_id, thread_id, user_id, entry.get("category", "note"))
+    return stored_entries
 
 async def recall_memories_async(user_text: str, chat, thread_id: int, user) -> Dict[str, object]:
     if not INTERNAL_REFLECTION_ENABLED:
@@ -2331,6 +2718,9 @@ async def recall_memories_async(user_text: str, chat, thread_id: int, user) -> D
     budget = max(200, MEMORY_BUDGET_CHARS)
     query_vec = await embed_text_async(user_text[:768]) if ai_available() else None
     candidates = []
+    mood_snapshot = get_cached_self_state()
+    mood_value = float(mood_snapshot.get("mood", 0.0))
+    tension_value = float(mood_snapshot.get("tension", 0.0))
     for scope, ids in scopes.items():
         chat_id, thread_key, user_id = ids
         rows = _memory_rows_for_scope(scope, chat_id, thread_key, user_id, limit=80)
@@ -2349,6 +2739,16 @@ async def recall_memories_async(user_text: str, chat, thread_id: int, user) -> D
                 sim = cosine(query_vec, vec)
                 score = 0.6 * score + 0.4 * sim
             scope_weight = MEMORY_SCOPE_WEIGHTS.get((scope, category), MEMORY_SCOPE_WEIGHTS.get((scope, "bias"), 1.0))
+            mood_factor = 1.0
+            if scope in ("thread", "user"):
+                mood_factor += 0.25 * mood_value
+            else:
+                mood_factor += 0.15 * mood_value
+            if category == "emotion_profile":
+                mood_factor += 0.35 * tension_value
+            elif category in ("thread_note", "thread_summary") and tension_value > 0.6:
+                mood_factor += 0.2 * tension_value
+            scope_weight *= max(0.2, min(1.8, mood_factor))
             recency_bonus = max(0.85, min(1.15, 1 + (max(time.time() - created_ts, 0) * -1e-6)))
             final_score = score * scope_weight * recency_bonus
             candidates.append({
@@ -2585,7 +2985,8 @@ async def process_memory_update_async(meta: dict, chat, thread_id: int, user,
             })
 
     if entries:
-        await _store_memories_with_decay(entries)
+        stored_entries = await _store_memories_with_decay(entries)
+        await _update_graph_from_relationship_entries(stored_entries, chat, thread_id)
 
 # ──────────────────────────────────────────────────────────────
 # 16b) Dev utilities — auto-reload on file change
@@ -2683,6 +3084,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (m.text or "").strip()
         if not text: return
         thread_id = 0
+        reply_to = getattr(m, "reply_to_message", None)
+        if reply_to and getattr(reply_to, "from_user", None) and user and meta:
+            src_id = getattr(user, "id", None)
+            tgt_id = getattr(reply_to.from_user, "id", None)
+            if src_id and tgt_id:
+                rel_meta = {
+                    "kind": "reply",
+                    "message_id": m.message_id,
+                    "reply_to_message_id": getattr(reply_to, "message_id", None)
+                }
+                asyncio.create_task(update_relationship_graph_async(
+                    src_id, tgt_id,
+                    getattr(chat, "id", 0), thread_id,
+                    "replied_to",
+                    text[:200] if text else "(reply)",
+                    m.message_id,
+                    meta.get("ts", int(time.time())),
+                    0.6,
+                    rel_meta
+                ))
+                asyncio.create_task(update_relationship_graph_async(
+                    tgt_id, src_id,
+                    getattr(chat, "id", 0), thread_id,
+                    "replied_by",
+                    text[:200] if text else "(reply)",
+                    m.message_id,
+                    meta.get("ts", int(time.time())),
+                    0.5,
+                    rel_meta
+                ))
         thread_ctx = fetch_thread_context(chat.id, thread_id, limit=24)
         sim = await similar_context(text, chat.id, thread_id, top_k=8)
         kg_snap = {"ents_here": kg_top_entities(chat.id, thread_id, 10),
@@ -2711,8 +3142,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await m.reply_text(resp)
                 asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
                                                                 thread_ctx, text, resp))
-                asyncio.create_task(analyze_user_affect_intent(meta, chat, thread_id, user, text))
+                mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
+                if not mood_state:
+                    mood_state = get_cached_self_state()
                 asyncio.create_task(maybe_update_system_prompt_from_reflection())
+                asyncio.create_task(maybe_trigger_breakout_event(context, chat, user, thread_id,
+                                                                 decision_meta, complexity_meta,
+                                                                 mood_state, thread_ctx, text))
             else:
                 await m.reply_text("AI is unavailable right now (Ollama not responding).")
             return
@@ -2723,6 +3159,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (m.text or "").strip()
     if not text: return
     thread_id = getattr(m, "message_thread_id", None) or 0
+    reply_to = getattr(m, "reply_to_message", None)
+    if reply_to and getattr(reply_to, "from_user", None) and user and meta:
+        src_id = getattr(user, "id", None)
+        tgt_id = getattr(reply_to.from_user, "id", None)
+        if src_id and tgt_id:
+            rel_meta = {
+                "kind": "reply",
+                "message_id": m.message_id,
+                "reply_to_message_id": getattr(reply_to, "message_id", None)
+            }
+            asyncio.create_task(update_relationship_graph_async(
+                src_id, tgt_id,
+                getattr(chat, "id", 0), thread_id,
+                "replied_to",
+                text[:200] if text else "(reply)",
+                m.message_id,
+                meta.get("ts", int(time.time())),
+                0.6,
+                rel_meta
+            ))
+            asyncio.create_task(update_relationship_graph_async(
+                tgt_id, src_id,
+                getattr(chat, "id", 0), thread_id,
+                "replied_by",
+                text[:200] if text else "(reply)",
+                m.message_id,
+                meta.get("ts", int(time.time())),
+                0.5,
+                rel_meta
+            ))
     thread_ctx = fetch_thread_context(chat.id, thread_id, limit=24)
     internal_state = await recall_memories_async(text, chat, thread_id, user)
     must = mentions_bot(m) or (getattr(m,"reply_to_message",None) and m.reply_to_message.from_user and m.reply_to_message.from_user.id == BOT_CACHE["id"])
@@ -2757,8 +3223,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat.id, text=resp)
             asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
                                                             thread_ctx, text, resp))
-            asyncio.create_task(analyze_user_affect_intent(meta, chat, thread_id, user, text))
+            mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
+            if not mood_state:
+                mood_state = get_cached_self_state()
             asyncio.create_task(maybe_update_system_prompt_from_reflection())
+            asyncio.create_task(maybe_trigger_breakout_event(context, chat, user, thread_id,
+                                                             decision_meta, complexity_meta,
+                                                             mood_state, thread_ctx, text))
             return
 
 # ──────────────────────────────────────────────────────────────
@@ -2868,27 +3339,6 @@ async def agree_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await context.bot.send_message(chat_id, f"👋 {user.mention_html()} has been onboarded and unlocked.", parse_mode="HTML")
     except Exception: pass
 
-async def greet_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat=update.effective_chat
-    if not update.message or not update.message.new_chat_members: return
-    bot_username=(await context.bot.get_me()).username
-    start_link=await build_start_link(bot_username, chat.id, chat.title)
-    for member in update.message.new_chat_members:
-        try:
-            mention = member.mention_html()
-        except Exception:
-            mention = member.full_name if hasattr(member, "full_name") else str(member.id)
-        text = (
-            f"Welcome {mention}! I would love to be able to converse with you.\n\n"
-            f"Tap this link to allow me to DM you: {start_link}"
-        )
-        try:
-            sent = await update.message.reply_html(text, disable_web_page_preview=True)
-        except Exception:
-            continue
-        if sent and getattr(member, "id", None):
-            _register_welcome_message(context, chat.id, member.id, sent.message_id)
-
 # ──────────────────────────────────────────────────────────────
 # 18) Resolve helpers
 # ──────────────────────────────────────────────────────────────
@@ -2947,7 +3397,6 @@ def main():
     app.add_handler(CommandHandler("setprimary", setprimary))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(agree_cb, pattern=r"^agree:\-?\d+$"))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, greet_new_members))
 
     # Admin tools
     app.add_handler(CommandHandler("config", config_cmd))
