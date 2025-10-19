@@ -16,6 +16,31 @@ from functools import wraps
 from typing import Optional, Tuple, List, Iterable, Dict, Callable
 from datetime import datetime, timezone
 
+# Memory visualizer (optional - graceful degradation if import fails)
+try:
+    from memory_visualizer import start_visualizer, log_recall, log_operation, update_stats, log_autonomous, update_sleep_state
+    VISUALIZER_AVAILABLE = True
+except ImportError:
+    VISUALIZER_AVAILABLE = False
+    def start_visualizer(): pass
+    def log_recall(*args, **kwargs): pass
+    def log_operation(*args, **kwargs): pass
+    def update_stats(*args, **kwargs): pass
+    def log_autonomous(*args, **kwargs): pass
+    def update_sleep_state(*args, **kwargs): pass
+
+# Sleep cycle (optional - graceful degradation if import fails)
+try:
+    from sleep_cycle import init_sleep_cycle, sleep_cycle_tick, get_sleep_cycle, is_sleeping, get_sleep_state
+    SLEEP_CYCLE_AVAILABLE = True
+except ImportError:
+    SLEEP_CYCLE_AVAILABLE = False
+    def init_sleep_cycle(*args, **kwargs): pass
+    async def sleep_cycle_tick(*args, **kwargs): pass
+    def get_sleep_cycle(): return None
+    def is_sleeping(): return False
+    def get_sleep_state(): return {'state': 'awake'}
+
 # ──────────────────────────────────────────────────────────────
 # 0) Self-bootstrap venv + deps (with PTB job-queue extra)
 # ──────────────────────────────────────────────────────────────
@@ -98,6 +123,8 @@ def write_env_template():
         MAX_CONTEXT_MESSAGES=300
         MAX_CONTEXT_CHARS=12000
         MAX_CONTEXT_USERS=60
+
+        MEMORY_VISUALIZER_ENABLED=true
         MAX_CONTEXT_GROUPS=30
 
         AUTO_SYSTEM_PROMPT_ENABLED=true
@@ -118,6 +145,11 @@ def write_env_template():
         MEMORY_USER_LIMIT=60
         MEMORY_GLOBAL_LIMIT=80
         MEMORY_SUMMARY_BATCH=10
+
+        SUMMARY_ROLLUP_INTERVAL_SECONDS=900
+
+        SLEEP_CYCLE_ENABLED=true
+        SLEEP_CYCLE_TICK_SECONDS=60
         """), encoding="utf-8")
 
 def ensure_env_file() -> dict:
@@ -164,6 +196,10 @@ MEMORY_THREAD_LIMIT = int((os.getenv("MEMORY_THREAD_LIMIT") or (CFG.get("MEMORY_
 MEMORY_USER_LIMIT = int((os.getenv("MEMORY_USER_LIMIT") or (CFG.get("MEMORY_USER_LIMIT") or "60")).strip() or "60")
 MEMORY_GLOBAL_LIMIT = int((os.getenv("MEMORY_GLOBAL_LIMIT") or (CFG.get("MEMORY_GLOBAL_LIMIT") or "80")).strip() or "80")
 MEMORY_SUMMARY_BATCH = int((os.getenv("MEMORY_SUMMARY_BATCH") or (CFG.get("MEMORY_SUMMARY_BATCH") or "10")).strip() or "10")
+MEMORY_VISUALIZER_ENABLED = ((os.getenv("MEMORY_VISUALIZER_ENABLED") or (CFG.get("MEMORY_VISUALIZER_ENABLED") or "true")).strip().lower() == "true")
+
+SLEEP_CYCLE_ENABLED = ((os.getenv("SLEEP_CYCLE_ENABLED") or (CFG.get("SLEEP_CYCLE_ENABLED") or "true")).strip().lower() == "true")
+SLEEP_CYCLE_TICK_SECONDS = int((os.getenv("SLEEP_CYCLE_TICK_SECONDS") or (CFG.get("SLEEP_CYCLE_TICK_SECONDS") or "60")).strip() or "60")
 
 if not BOT_TOKEN:
     print("[env] BOT_TOKEN is empty. Set it and run again."); sys.exit(1)
@@ -1439,8 +1475,12 @@ async def autosystem_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def autosystem_job(context: ContextTypes.DEFAULT_TYPE):
     if not AUTO_SYS_ENABLED: return
     try:
+        log_autonomous('assessment', scope='global', details='Auto-generating system prompt')
         p = await auto_generate_system_prompt(context, include_digest_in_meta=False)
-        if p: await set_system_prompt_and_persist(p)
+        if p:
+            await set_system_prompt_and_persist(p)
+            log_autonomous('assessment', scope='global', count=1,
+                          details='System prompt auto-generated and persisted')
     except Exception: pass
 
 # ──────────────────────────────────────────────────────────────
@@ -1553,6 +1593,8 @@ async def update_profile_for_user(user_id: int):
 async def profile_background_job(context: ContextTypes.DEFAULT_TYPE):
     if not PROFILES_ENABLED: return
     try:
+        log_autonomous('assessment', scope='profile', details='Starting profile background update')
+
         # candidates: most recently active users
         with closing(db()) as con:
             cands = con.execute("""
@@ -1570,7 +1612,13 @@ async def profile_background_job(context: ContextTypes.DEFAULT_TYPE):
             if (int(time.time()) - last_upd) >= PROFILE_REFRESH_MINUTES*60:
                 await update_profile_for_user(int(uid))
                 updated += 1
+                log_autonomous('assessment', scope='user', count=1,
+                              details=f'Updated profile for user {uid}')
                 if updated >= 3: break
+
+        if updated > 0:
+            log_autonomous('assessment', scope='profile', count=updated,
+                          details=f'Completed profile updates for {updated} users')
     except Exception:
         # swallow background errors
         pass
@@ -1732,6 +1780,10 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
         {bundle.get('global_themes') or '(none)'}
           Emotional cues:
         {bundle.get('emotional_state') or '(none)'}
+          Summary rollup:
+        {bundle.get('summary_rollup') or '(none)'}
+          Global rollup:
+        {bundle.get('global_rollup') or '(none)'}
 
         COMPLEXITY GAUGE:
           Level: {complexity.get('complexity', 'low')}
@@ -1905,6 +1957,9 @@ INTERNAL_TOOLS = {
 
 SELF_STATE_CACHE: Dict[str, Dict[str, object]] = {"global": {"ts": 0.0, "state": {"mood": 0.0, "tension": 0.15, "last_feedback_ts": 0, "data": {}}}}
 BREAKOUT_COOLDOWN_SECONDS = 3600
+SUMMARY_ROLLUP_THRESHOLD = 6
+SUMMARY_ROLLUP_KEEP = 4
+SUMMARY_ROLLUP_INTERVAL_SECONDS = 900
 
 def _memory_limit_for(scope: str) -> int:
     if scope == "thread":
@@ -2312,6 +2367,145 @@ async def maybe_trigger_breakout_event(context: ContextTypes.DEFAULT_TYPE, chat,
     }, ensure_ascii=False)
     await record_breakout_event_async(user_id, chat_id, thread_id or 0, trigger, details, status)
 
+def fetch_latest_summary(scope: str, chat_id: int, thread_id: int, user_id: int = 0, category: Optional[str] = None) -> str:
+    query = """SELECT summary FROM memory_summaries
+               WHERE scope=? AND chat_id=? AND thread_id=? AND user_id=?
+               {cat_clause}
+               ORDER BY created_ts DESC LIMIT 1"""
+    cat_clause = ""
+    params: List[object] = [scope, chat_id, thread_id, user_id]
+    if category:
+        cat_clause = "AND category=?"
+        params.append(category)
+    query = query.format(cat_clause=cat_clause)
+    with closing(db()) as con:
+        row = con.execute(query, params).fetchone()
+    return row[0] if row else ""
+
+async def hierarchical_memory_rollup():
+    try:
+        log_autonomous('consolidation', scope='all', details='Scanning for rollup candidates')
+
+        with closing(db()) as con:
+            rows = con.execute(
+                """SELECT id, scope, chat_id, thread_id, user_id, category, content, metadata, weight, created_ts
+                   FROM memory_entries
+                   WHERE category LIKE '%_summary'
+                   ORDER BY created_ts DESC
+                   LIMIT 400"""
+            ).fetchall()
+        groups: Dict[tuple, List[dict]] = {}
+        for row in rows:
+            (mid, scope, chat_id, thread_id, user_id,
+             category, content, metadata_json, weight, created_ts) = row
+            base_cat = category[:-8] if category.endswith("_summary") else category
+            key = (scope, chat_id, thread_id, user_id, base_cat)
+            try:
+                metadata = json.loads(metadata_json or "{}")
+            except Exception:
+                metadata = {}
+            groups.setdefault(key, []).append({
+                "id": mid,
+                "scope": scope,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "category": category,
+                "base_category": base_cat,
+                "content": content,
+                "metadata": metadata,
+                "weight": float(weight or metadata.get("confidence", 0.5)),
+                "created_ts": int(created_ts or 0),
+            })
+        now = int(time.time())
+        for key, entries in groups.items():
+            if len(entries) < SUMMARY_ROLLUP_THRESHOLD:
+                continue
+            scope, chat_id, thread_id, user_id, base_category = key
+            entries.sort(key=lambda e: (e["weight"], e["created_ts"]), reverse=True)
+            top_entries = entries[: min(len(entries), SUMMARY_ROLLUP_THRESHOLD + 2)]
+            prompt_payload = []
+            for e in top_entries:
+                prompt_payload.append({
+                    "content": e["content"],
+                    "weight": e["weight"],
+                    "metadata": e.get("metadata", {}),
+                })
+            prompt = textwrap.dedent(f"""
+                Create a concise hierarchical summary capturing the key patterns, relationships, and signals
+                from the following memory summaries. Structure it as:
+                - OVERVIEW: <short paragraph>
+                - HIGHLIGHTS: <2-4 bullet points>
+                - NEXT_STEPS: <1-2 suggestions if applicable, else omit>
+
+                Focus on what's actionable or distinctive. Preserve any critical participants or tags mentioned.
+
+                SUMMARIES:
+                {json.dumps(prompt_payload, ensure_ascii=False)}
+            """).strip()
+            rollup = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
+            rollup = _sanitize_internal_blob(rollup or "")
+            if not rollup:
+                continue
+            metadata = {
+                "source_summary_ids": [e["id"] for e in top_entries],
+                "base_category": base_category,
+                "generated": now,
+                "count": len(top_entries),
+            }
+            def _store_summary(con: sqlite3.Connection):
+                con.execute(
+                    """INSERT INTO memory_summaries(scope,chat_id,thread_id,user_id,category,summary,metadata,created_ts)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (scope, chat_id, thread_id, user_id, f"{base_category}_rollup", rollup,
+                     json.dumps(metadata, ensure_ascii=False), now)
+                )
+                con.commit()
+            if DBW:
+                await DBW.run(DB_PATH, _store_summary)
+            else:
+                with closing(db()) as con:
+                    _store_summary(con)
+
+            log_autonomous('consolidation', scope=scope, count=len(top_entries),
+                          details=f'Rolled up {base_category}')
+
+            # prune older summaries beyond keep count
+            if len(entries) > SUMMARY_ROLLUP_KEEP:
+                to_delete = [e["id"] for e in entries[SUMMARY_ROLLUP_KEEP:]]
+                await _delete_memory_entries_async(to_delete)
+                log_autonomous('decay', scope=scope, count=len(to_delete),
+                              details=f'Pruned old {base_category} summaries')
+    except Exception:
+        pass
+
+async def hierarchical_rollup_job(context: ContextTypes.DEFAULT_TYPE):
+    log_autonomous('rollup', scope='hierarchical', details='Starting hierarchical memory rollup')
+    await hierarchical_memory_rollup()
+    log_autonomous('rollup', scope='hierarchical', details='Completed hierarchical memory rollup')
+
+async def sleep_cycle_job(context: ContextTypes.DEFAULT_TYPE):
+    """Autonomous sleep cycle tick - manages sleep/wake states and deep memory processing"""
+    if not SLEEP_CYCLE_ENABLED or not SLEEP_CYCLE_AVAILABLE:
+        return
+
+    try:
+        # Tick the sleep cycle
+        await sleep_cycle_tick(ai_generate_fn=ai_generate_async)
+
+        # Update visualizer with current sleep state
+        state_info = get_sleep_state()
+        update_sleep_state(
+            state=state_info['state'],
+            time_in_state=state_info['time_in_state'],
+            cycle_count=state_info['cycle_count'],
+            discoveries=state_info['discoveries']
+        )
+
+    except Exception as e:
+        # Swallow errors in background job
+        pass
+
 def assemble_context_bundle(chat, thread_id: int, user, message_text: str,
                             thread_ctx: str, memory_state: Dict[str, object]) -> Dict[str, str]:
     snippets = memory_state.get("snippets") or []
@@ -2355,6 +2549,8 @@ def assemble_context_bundle(chat, thread_id: int, user, message_text: str,
         "emotional_state": "\n".join(emotion_lines[:4]) or "(none)",
         "self_mood": f"{mood_state.get('mood', 0.0):+.2f}",
         "self_tension": f"{mood_state.get('tension', 0.0):.2f}",
+        "summary_rollup": fetch_latest_summary("thread", getattr(chat, "id", 0), thread_id) or "(none)",
+        "global_rollup": fetch_latest_summary("global", 0, 0) or "(none)",
     }
 
 async def assess_discussion_complexity(message_text: str,
@@ -2647,6 +2843,10 @@ async def _maybe_decay_memories_async(scope: str, chat_id: int, thread_id: int, 
         ).fetchone()[0]
     if count <= limit:
         return
+
+    log_autonomous('decay', scope=scope, count=count-limit,
+                  details=f'Memory limit exceeded for {category}')
+
     batch = max(3, MEMORY_SUMMARY_BATCH)
     with closing(db()) as con:
         rows = con.execute(
@@ -2692,6 +2892,9 @@ async def _maybe_decay_memories_async(scope: str, chat_id: int, thread_id: int, 
     await _store_memory_entry_async(scope, chat_id, thread_id, user_id, f"{category}_summary", summary, metadata, metadata["confidence"], sources)
     await _delete_memory_entries_async(aggregated_ids)
 
+    log_autonomous('consolidation', scope=scope, count=len(aggregated_ids),
+                  details=f'Consolidated {len(aggregated_ids)} {category} memories into summary')
+
 async def _store_memories_with_decay(entries: List[dict]) -> List[dict]:
     scope_groups: Dict[tuple, list[dict]] = {}
     stored_entries: List[dict] = []
@@ -2706,6 +2909,16 @@ async def _store_memories_with_decay(entries: List[dict]) -> List[dict]:
         stored_entry = {**entry}
         stored_entry["_entry_id"] = entry_id
         stored_entries.append(stored_entry)
+
+        # Log memory storage operation to visualizer
+        log_operation(
+            "store",
+            scope=scope,
+            category=entry.get("category", "note"),
+            content=entry.get("content", "")[:80],
+            weight=entry.get("weight", 0.6)
+        )
+
     for (scope, chat_id, thread_id, user_id), group in scope_groups.items():
         for entry in group:
             await _maybe_decay_memories_async(scope, chat_id, thread_id, user_id, entry.get("category", "note"))
@@ -2774,6 +2987,16 @@ async def recall_memories_async(user_text: str, chat, thread_id: int, user) -> D
             continue
         used_chars += snippet_len + 20
         selected.append(cand)
+
+        # Log to visualizer
+        log_recall(
+            scope=cand["scope"],
+            category=cand["category"],
+            content=text_body,
+            weight=cand["weight"],
+            metadata=cand["metadata"]
+        )
+
         if not bias_line and "bias" in cand["category"]:
             bias_line = text_body
         if not narrative and cand["category"] in ("thread_note", "user_trait", "global_theme", "thread_summary", "relationship", "self_reflection"):
@@ -2781,6 +3004,20 @@ async def recall_memories_async(user_text: str, chat, thread_id: int, user) -> D
         if used_chars >= budget:
             break
     narrative = narrative or (selected[0]["content"] if selected else "")
+
+    # Update visualizer stats
+    scope_counts = {}
+    for s in selected:
+        scope = s["scope"]
+        scope_counts[scope] = scope_counts.get(scope, 0) + 1
+    update_stats(
+        thread=scope_counts.get('thread', 0),
+        user=scope_counts.get('user', 0),
+        global_scope=scope_counts.get('global', 0),
+        total_recalls=len(selected),
+        last_recall_time=time.time()
+    )
+
     return {
         "narrative": narrative.strip(),
         "bias": bias_line.strip(),
@@ -3379,6 +3616,14 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     start_auto_reloader()
 
+    # Start memory visualizer if available and enabled
+    if VISUALIZER_AVAILABLE and MEMORY_VISUALIZER_ENABLED:
+        print("[visualizer] Starting memory consciousness visualizer...")
+        start_visualizer()
+        print("[visualizer] Visualizer running. Press 'q' in the visualizer to close it.")
+    elif MEMORY_VISUALIZER_ENABLED and not VISUALIZER_AVAILABLE:
+        print("[visualizer] Memory visualizer enabled but module not available. Install curses support.")
+
     # Ensure base schema present
     with closing(db()): pass
 
@@ -3386,6 +3631,14 @@ def main():
     global DBW
     DBW = DBWriteQueue()
     DBW.start()
+
+    # Initialize sleep cycle if enabled
+    if SLEEP_CYCLE_ENABLED and SLEEP_CYCLE_AVAILABLE:
+        print("[sleep] Initializing autonomous sleep cycle...")
+        init_sleep_cycle(DB_PATH, visualizer_log_fn=log_autonomous)
+        print(f"[sleep] Sleep cycle enabled. Tick interval: {SLEEP_CYCLE_TICK_SECONDS}s")
+    elif SLEEP_CYCLE_ENABLED and not SLEEP_CYCLE_AVAILABLE:
+        print("[sleep] Sleep cycle enabled but module not available.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -3436,6 +3689,13 @@ def main():
         jq.run_repeating(autosystem_job, interval=AUTO_SYS_INTERVAL_HOURS*3600, first=AUTO_SYS_INTERVAL_HOURS*3600)
     if PROFILES_ENABLED and jq:
         jq.run_repeating(profile_background_job, interval=PROFILE_REFRESH_MINUTES*60, first=60)
+    if jq:
+        jq.run_repeating(hierarchical_rollup_job, interval=SUMMARY_ROLLUP_INTERVAL_SECONDS, first=SUMMARY_ROLLUP_INTERVAL_SECONDS)
+
+    # Schedule sleep cycle job
+    if SLEEP_CYCLE_ENABLED and SLEEP_CYCLE_AVAILABLE and jq:
+        jq.run_repeating(sleep_cycle_job, interval=SLEEP_CYCLE_TICK_SECONDS, first=SLEEP_CYCLE_TICK_SECONDS)
+        print(f"[sleep] Sleep cycle job scheduled (every {SLEEP_CYCLE_TICK_SECONDS}s)")
 
     print("Bot running…")
     app.run_polling()
