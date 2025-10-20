@@ -155,7 +155,24 @@ ensure_venv_and_deps()
 
 # Memory visualizer (optional - graceful degradation if import fails)
 try:
-    from memory_visualizer import start_visualizer, log_recall, log_operation, update_stats, log_autonomous, update_sleep_state
+    import memory_visualizer as _memory_visualizer
+
+    start_visualizer = _memory_visualizer.start_visualizer
+    log_recall = _memory_visualizer.log_recall
+    log_operation = _memory_visualizer.log_operation
+    update_stats = _memory_visualizer.update_stats
+    log_autonomous = _memory_visualizer.log_autonomous
+    update_sleep_state = _memory_visualizer.update_sleep_state
+    if hasattr(_memory_visualizer, "log_emotion_state"):
+        log_emotion_state = _memory_visualizer.log_emotion_state  # type: ignore[attr-defined]
+    else:
+        def log_emotion_state(**details):
+            # Mirror other visualizer hooks when emotion logging isn't implemented yet.
+            try:
+                log_operation("emotion_state", **details)
+            except Exception:
+                pass
+
     VISUALIZER_AVAILABLE = True
     print("[bootstrap] ✓ Memory visualizer imported successfully")
 except ImportError as e:
@@ -199,6 +216,11 @@ except ImportError as e:
         if _fallback_visualizer_started:
             payload = kwargs if kwargs else args
             _mv_fallback_log("sleep", str(payload))
+
+    def log_emotion_state(*args, **kwargs):
+        if _fallback_visualizer_started:
+            payload = kwargs if kwargs else args
+            _mv_fallback_log("emotion", str(payload))
 
 # Inside venv
 import requests
