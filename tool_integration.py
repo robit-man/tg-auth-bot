@@ -375,10 +375,11 @@ class ToolExecutor:
                         )
 
                 # Execute tool (handle async)
-                if tool_meta.is_async:
+                is_async_callable = tool_meta.is_async or asyncio.iscoroutinefunction(tool_fn)  # type: ignore[arg-type]
+                if is_async_callable:
                     result = await tool_fn(*args, **kwargs)
                 else:
-                    result = tool_fn(*args, **kwargs)
+                    result = await asyncio.to_thread(tool_fn, *args, **kwargs)
 
                 execution_time = time.time() - start_time
 
@@ -577,6 +578,9 @@ def build_tool_context_for_prompt(
             "",
             "4. Get system info:",
             "   location = Tools.get_current_location()",
+            "",
+            "5. Orchestrate a multi-step project:",
+            "   outcome = Tools.plan_complex_task('Refactor the workspace README and summarize changes')",
             "",
             "5. Complex multi-step search:",
             "   result = Tools.complex_search_agent(",

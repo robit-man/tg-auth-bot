@@ -267,6 +267,13 @@ except ImportError:
     handle_rating_callback = None  # type: ignore
     REAL_TOOL_EXECUTION_AVAILABLE = False
 
+try:
+    from tools import Tools  # type: ignore
+    TOOLS_MODULE_AVAILABLE = True
+except ImportError:
+    Tools = None  # type: ignore
+    TOOLS_MODULE_AVAILABLE = False
+
 # ──────────────────────────────────────────────────────────────
 # 1) .env + config (auto-detect Ollama models)
 # ──────────────────────────────────────────────────────────────
@@ -1379,6 +1386,7 @@ def command_catalog() -> Dict[str, List[tuple]]:
         ("/graph [here|server] [N]", "Show KG relations."),
         ("/autosystem [why]", "Regenerate the system prompt."),
         ("/tools", "List available tool functions exposed to the AI."),
+        ("/plan <objective>", "Delegate a complex multi-step task to the autonomous planner."),
     ]
     return {"public": public, "admin": admin}
 
@@ -1705,6 +1713,170 @@ async def tools_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(catalog) > 3500:
         catalog = catalog[:3497] + "..."
     await update.effective_message.reply_text(f"Available tools:\n{catalog}")
+
+
+@admin_only
+async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /plan - Delegate a complex, multi-step task to the autonomous planner.
+
+    Usage:
+      /plan Investigate the failing tests
+      /plan Draft release notes for v1.2
+      /plan Refactor module X
+      Constraints: keep changes under 10 files
+      Deliverables: summary + patch
+
+    You can also reply to a user's message with /plan to use their text as the objective.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat:
+        return
+
+    if not TOOLS_MODULE_AVAILABLE or not Tools:
+        await message.reply_text(
+            "⚠️ Tools module unavailable. Install the tool dependencies before using /plan."
+        )
+        return
+
+    raw_text = message.text or ""
+    args_text = ""
+    if raw_text:
+        parts = raw_text.split(maxsplit=1)
+        if len(parts) > 1:
+            args_text = parts[1]
+
+    objective_lines: List[str] = []
+    constraints = None
+    deliverables = None
+
+    for raw_line in filter(None, args_text.splitlines()):
+        stripped = raw_line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("constraints:"):
+            constraints = stripped.split(":", 1)[1].strip()
+        elif lowered.startswith("deliverables:"):
+            deliverables = stripped.split(":", 1)[1].strip()
+        else:
+            objective_lines.append(stripped)
+
+    objective = " ".join(objective_lines).strip()
+
+    if not objective and message.reply_to_message:
+        reply_text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
+        if reply_text:
+            objective = reply_text
+
+    if not objective:
+        guidance = (
+            "Provide an objective after /plan (optionally add lines starting with "
+            "'Constraints:' or 'Deliverables:'). You can also reply to a message with /plan."
+        )
+        await message.reply_text(guidance)
+        return
+
+    session_label = f"tg-{chat.id}-{message.message_id}"
+
+    try:
+        plan_result = await with_typing(
+            context,
+            chat.id,
+            asyncio.to_thread(
+                Tools.plan_complex_task,
+                objective,
+                constraints=constraints,
+                deliverables=deliverables,
+                session_id=session_label,
+            ),
+        )
+    except Exception as exc:
+        await message.reply_text(f"⚠️ Planning failed to start: {exc}")
+        return
+
+    if not isinstance(plan_result, dict):
+        await message.reply_text("⚠️ Planner returned an unexpected result.")
+        return
+
+    error_msg = plan_result.get("error")
+    if error_msg:
+        lines = [f"⚠️ Planning error: {error_msg}"]
+        tb = plan_result.get("traceback")
+        if isinstance(tb, str) and tb.strip():
+            lines.append("")
+            lines.append(tb.strip()[-800:])
+        await message.reply_text("\n".join(lines))
+        return
+
+    success = bool(plan_result.get("success", True))
+    summary_data = plan_result.get("summary")
+    step_stats = ""
+    if isinstance(summary_data, dict):
+        total_steps = summary_data.get("total_steps")
+        successes = summary_data.get("successes")
+        failures = summary_data.get("failures") or []
+        if total_steps is not None and successes is not None:
+            step_stats = f"{successes}/{total_steps} steps completed"
+        if failures:
+            fail_labels = [str(f) for f in failures if f]
+            if len(fail_labels) > 4:
+                fail_display = ", ".join(fail_labels[:4]) + ", …"
+            else:
+                fail_display = ", ".join(fail_labels)
+            if step_stats:
+                step_stats += "; "
+            step_stats += f"failed: {fail_display}"
+    elif isinstance(summary_data, str):
+        step_stats = summary_data
+
+    plan_data = plan_result.get("plan") or {}
+    plan_objective = plan_data.get("objective") or objective
+    steps_preview: List[str] = []
+    steps = plan_data.get("steps") or []
+    if isinstance(steps, list):
+        for step in steps[:5]:
+            if isinstance(step, dict):
+                step_id = str(step.get("id") or "?")
+                title = str(step.get("title") or "")
+                tool = str(step.get("tool") or "reasoning")
+                steps_preview.append(f"• {html.escape(step_id)} — {html.escape(title)} [{html.escape(tool)}]")
+        if len(steps) > 5:
+            steps_preview.append(f"• … ({len(steps) - 5} additional steps)")
+
+    artifacts = plan_result.get("artifacts")
+    artifact_line = ""
+    if isinstance(artifacts, dict):
+        artifact_line = f"{len(artifacts)} artifact entries captured"
+
+    logs = plan_result.get("logs") or []
+    log_preview: List[str] = []
+    if isinstance(logs, list) and logs:
+        tail = logs[-5:]
+        for entry in tail:
+            log_preview.append(f"• {html.escape(str(entry))}")
+
+    lines = [
+        f"<b>Planning objective</b>: {html.escape(plan_objective)}",
+        f"<b>Status</b>: {'✅ Success' if success else '⚠️ Issues detected'}",
+    ]
+    if step_stats:
+        lines.append(f"<b>Steps</b>: {html.escape(step_stats)}")
+    if constraints:
+        lines.append(f"<b>Constraints</b>: {html.escape(constraints)}")
+    if deliverables:
+        lines.append(f"<b>Deliverables</b>: {html.escape(deliverables)}")
+    lines.append(f"<b>Session</b>: {html.escape(session_label)}")
+    if steps_preview:
+        lines.append("<b>Planned steps</b>:")
+        lines.extend(steps_preview)
+    if artifact_line:
+        lines.append(f"<b>Artifacts</b>: {html.escape(artifact_line)}")
+    if log_preview:
+        lines.append("<b>Log tail</b>:")
+        lines.extend(log_preview)
+
+    await message.reply_html("\n".join(lines), disable_web_page_preview=True)
+
 
 # /setadmin bootstrap & approvals (unchanged)
 async def setadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4749,6 +4921,7 @@ def main():
     app.add_handler(CommandHandler("autosystem", autosystem_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("tools", tools_cmd))
+    app.add_handler(CommandHandler("plan", plan_cmd))
 
     # Profiles (DM)
     app.add_handler(CommandHandler("profile", profile_cmd))

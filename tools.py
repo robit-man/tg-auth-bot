@@ -38,6 +38,7 @@ import subprocess
 import textwrap
 import time
 import traceback
+import uuid
 import fnmatch  # <-- added for file helpers
 from dataclasses import dataclass
 from datetime import datetime
@@ -2081,6 +2082,131 @@ class Tools:
             return {"returncode": None, "stdout": exc.stdout or "", "stderr": f"Timeout: {exc}"}
         except Exception as exc:
             return {"returncode": None, "stdout": "", "stderr": str(exc)}
+
+    @staticmethod
+    def _planning_tool_registry(overrides: Optional[Dict[str, Callable[..., Any]]] = None) -> Dict[str, Callable[..., Any]]:
+        """
+        Build the default tool registry exposed to the autonomous planning engine.
+        """
+        registry: Dict[str, Callable[..., Any]] = {
+            "search_internet": Tools.search_internet,
+            "complex_search_agent": Tools.complex_search_agent,
+            "fetch_webpage": Tools.fetch_webpage,
+            "find_file": Tools.find_file,
+            "find_files": Tools.find_files,
+            "list_dir": Tools.list_dir,
+            "list_files": Tools.list_files,
+            "list_workspace": Tools.list_workspace,
+            "search_text": Tools.search_text,
+            "read_file": Tools.read_file,
+            "read_files": Tools.read_files,
+            "write_file": Tools.write_file,
+            "create_file": Tools.create_file,
+            "append_file": Tools.append_file,
+            "delete_file": Tools.delete_file,
+            "rename_file": Tools.rename_file,
+            "copy_file": Tools.copy_file,
+            "file_exists": Tools.file_exists,
+            "file_info": Tools.file_info,
+            "get_cwd": Tools.get_cwd,
+            "get_current_location": Tools.get_current_location,
+            "get_system_utilization": Tools.get_system_utilization,
+            "run_bash": Tools.run_bash,
+        }
+
+        # Allow runtime tools to participate (without overriding core entries unless requested).
+        for name, fn in Tools.runtime_tool_functions().items():
+            if name == "plan_complex_task":
+                continue
+            registry.setdefault(name, fn)
+
+        if overrides:
+            for name, fn in overrides.items():
+                if name == "plan_complex_task":
+                    continue
+                registry[name] = fn
+
+        return registry
+
+    @staticmethod
+    def plan_complex_task(objective: str,
+                          constraints: Optional[str] = None,
+                          deliverables: Optional[str] = None,
+                          *,
+                          session_id: Optional[str] = None,
+                          model: Optional[str] = None,
+                          config_path: Optional[str] = None,
+                          tool_overrides: Optional[Dict[str, Callable[..., Any]]] = None) -> dict:
+        """
+        Plan and execute a multi-step task using the autonomous PlanningEngine.
+
+        The planner can chain filesystem operations, run bash commands, perform web
+        research, and synthesize results via the tools registry. All commands run
+        inside the workspace root resolved by tools.py.
+
+        Args:
+            objective (str): Clear description of the end goal.
+            constraints (str, optional): Notable constraints (time, safety, tooling).
+            deliverables (str, optional): Expected outputs (files, summaries, reports).
+            session_id (str, optional): Identifier used for logging/auditing.
+            model (str, optional): Override the LLM model used for planning.
+            config_path (str, optional): Path to planning.json configuration file.
+            tool_overrides (dict, optional): Extra or replacement tool bindings.
+
+        Returns:
+            dict: Planner outcome containing success flag, summary, plan, artifacts, logs.
+                  On failure returns {"success": False, "error": "...", "traceback": "...?"}.
+        """
+        objective = (objective or "").strip()
+        if not objective:
+            return {"success": False, "error": "objective_required"}
+
+        try:
+            from planning_bridge import PlanningBridge
+        except Exception as exc:
+            return {"success": False, "error": f"planning_bridge_import_failed: {exc}"}
+
+        if not PlanningBridge.available():
+            return {"success": False, "error": "planning_engine_unavailable"}
+
+        registry = Tools._planning_tool_registry(tool_overrides)
+        constraints_norm = (constraints or "").strip() or None
+        deliverables_norm = (deliverables or "").strip() or None
+        session_label = session_id or f"plan-{uuid.uuid4().hex[:8]}"
+        config_target = config_path or str(WORKSPACE_ROOT / "planning.json")
+
+        try:
+            result = PlanningBridge.run_plan(
+                objective=objective,
+                constraints=constraints_norm,
+                deliverables=deliverables_norm,
+                session_id=session_label,
+                tools=registry,
+                config_path=config_target,
+                model=model,
+            )
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"planning_execution_failed: {exc}",
+                "traceback": traceback.format_exc()[-1600:],
+            }
+
+        if isinstance(result, dict):
+            result.setdefault("success", bool(result.get("success", True)))
+            result.setdefault("objective", objective)
+            result.setdefault("constraints", constraints_norm)
+            result.setdefault("deliverables", deliverables_norm)
+            result.setdefault("session_id", session_label)
+        else:
+            result = {
+                "success": False,
+                "error": "unexpected_planning_result",
+                "raw": result,
+                "session_id": session_label,
+            }
+
+        return result
 
     @staticmethod
     def search_text(pattern: str,
