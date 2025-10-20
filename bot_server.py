@@ -362,11 +362,12 @@ def init_intelligent_components():
 def admin_only(fn):
     @wraps(fn)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat = update.effective_chat; user = update.effective_user
-        if not chat or chat.type not in ("group","supergroup"):
+        chat = update.effective_chat
+        user = update.effective_user
+        if not chat or chat.type not in ("group", "supergroup"):
             return await update.effective_message.reply_text("Run this in a group.")
         member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status not in ("administrator","creator"):
+        if member.status not in ("administrator", "creator"):
             return await update.effective_message.reply_text("Admins only.")
         return await fn(update, context)
     return wrapper
