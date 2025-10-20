@@ -26,15 +26,31 @@ from datetime import datetime, timezone
 
 # Sleep cycle (optional - graceful degradation if import fails)
 try:
-    from sleep_cycle import init_sleep_cycle, sleep_cycle_tick, get_sleep_cycle, is_sleeping, get_sleep_state
+    from sleep_cycle import (
+        init_sleep_cycle,
+        sleep_cycle_tick,
+        get_sleep_cycle,
+        is_sleeping,
+        get_sleep_state,
+        SleepState,
+    )
     SLEEP_CYCLE_AVAILABLE = True
 except ImportError:
     SLEEP_CYCLE_AVAILABLE = False
+
+    class SleepState:
+        AWAKE = "awake"
+        DROWSY = "drowsy"
+        LIGHT_SLEEP = "light_sleep"
+        DEEP_SLEEP = "deep_sleep"
+        REM_SLEEP = "rem_sleep"
+        WAKING = "waking"
+
     def init_sleep_cycle(*args, **kwargs): pass
     async def sleep_cycle_tick(*args, **kwargs): pass
     def get_sleep_cycle(): return None
     def is_sleeping(): return False
-    def get_sleep_state(): return {'state': 'awake'}
+    def get_sleep_state(): return {'state': SleepState.AWAKE, 'time_in_state': 0, 'cycle_count': 0, 'discoveries': {}}
 
 # ──────────────────────────────────────────────────────────────
 # 0) Self-bootstrap venv + deps (with PTB job-queue extra)
@@ -3495,6 +3511,16 @@ async def sleep_cycle_job(context: ContextTypes.DEFAULT_TYPE):
             discoveries=state_info['discoveries']
         )
 
+        state = state_info.get("state")
+        time_in_state = float(state_info.get("time_in_state") or 0.0)
+        trigger_window = max(3.0, SLEEP_CYCLE_TICK_SECONDS / 2)
+        if state in (SleepState.DEEP_SLEEP, SleepState.REM_SLEEP, SleepState.WAKING) and time_in_state < trigger_window:
+            force_prompt = state in (SleepState.REM_SLEEP, SleepState.WAKING)
+            await maybe_update_system_prompt_from_reflection(
+                force=force_prompt,
+                sleep_context=state_info
+            )
+
     except Exception as e:
         # Swallow errors in background job
         pass
@@ -3754,13 +3780,23 @@ async def analyze_user_affect_intent(meta: dict, chat, thread_id: int, user, mes
     )
     return mood_state
 
-async def maybe_update_system_prompt_from_reflection(force: bool = False):
+async def maybe_update_system_prompt_from_reflection(
+    force: bool = False,
+    sleep_context: Optional[Dict[str, Any]] = None,
+):
     if not ai_available():
         return
+    sleep_state = (sleep_context or {}).get("state")
+    dream_priority_states = {
+        SleepState.DEEP_SLEEP,
+        SleepState.REM_SLEEP,
+        SleepState.WAKING,
+    }
+    allow_sleep_override = sleep_state in dream_priority_states
     now = int(time.time())
     last_raw = settings_get("REFLECTIVE_PROMPT_TS")
     last_ts = int(last_raw) if last_raw and last_raw.isdigit() else 0
-    if not force and now - last_ts < 3600:
+    if not force and not allow_sleep_override and now - last_ts < 3600:
         return
     with closing(db()) as con:
         reflection_rows = con.execute(
@@ -3773,7 +3809,12 @@ async def maybe_update_system_prompt_from_reflection(force: bool = False):
                WHERE scope='global' AND category LIKE '%_rollup'
                ORDER BY created_ts DESC LIMIT 5"""
         ).fetchall()
-    if not reflection_rows and not summary_rows:
+        dream_rows = con.execute(
+            """SELECT content, metadata, scope, created_ts FROM memory_entries
+               WHERE category='dream_insight'
+               ORDER BY created_ts DESC LIMIT 6"""
+        ).fetchall()
+    if not reflection_rows and not summary_rows and not dream_rows:
         return
     reflections = []
     for content, metadata_json in reflection_rows:
@@ -3797,10 +3838,50 @@ async def maybe_update_system_prompt_from_reflection(force: bool = False):
         snippet = textwrap.shorten((summary or "").strip(), width=320, placeholder="…")
         label = category or "rollup"
         summaries.append(f"[{stamp}] ({label}) {snippet}")
+    dream_lines = []
+    for content, metadata_json, scope_label, created_ts in dream_rows:
+        meta = {}
+        try:
+            meta = json.loads(metadata_json or "{}")
+        except Exception:
+            pass
+        cycle = meta.get("sleep_cycle")
+        tags = meta.get("tags") or []
+        generated_ts = meta.get("generated_at") or created_ts
+        stamp = datetime.fromtimestamp(generated_ts).isoformat(timespec="seconds")
+        snippet = textwrap.shorten((content or "").strip(), width=260, placeholder="…")
+        tag_txt = f" tags={','.join(tags[:3])}" if tags else ""
+        dream_lines.append(f"[cycle {cycle if cycle is not None else '?'} | {scope_label} | {stamp}] {snippet}{tag_txt}")
+    state_label = (sleep_state or SleepState.AWAKE).replace("_", " ").title()
+    time_in_state = (sleep_context or {}).get("time_in_state")
+    cycle_count = (sleep_context or {}).get("cycle_count")
+    discoveries = (sleep_context or {}).get("discoveries") or {}
+    discoveries_line = ", ".join(f"{k}:{v}" for k, v in discoveries.items() if v)
+    sleep_summary_parts = [
+        f"state={state_label}",
+        f"cycle={cycle_count}" if cycle_count is not None else "",
+        f"time_in_state={int(time_in_state)}s" if time_in_state is not None else "",
+    ]
+    sleep_summary = " ".join(part for part in sleep_summary_parts if part) or "(no active sleep context)"
+    if discoveries_line:
+        sleep_summary += f"\nDiscoveries: {discoveries_line}"
+    dream_directive = "Normal consolidation; maintain balanced tone."
+    if sleep_state == SleepState.DEEP_SLEEP:
+        dream_directive = "Deep-sleep phase: emphasize analytical rigor, reinforce safety guardrails, and integrate structural insights."
+    elif sleep_state == SleepState.REM_SLEEP:
+        dream_directive = "REM dream phase: let dream insights steer tone boldly toward creative but safe experimentation."
+    elif sleep_state == SleepState.WAKING:
+        dream_directive = "Waking integration: translate overnight discoveries into actionable guidance and refreshed priorities."
     prompt = textwrap.dedent(f"""
         Use the latest global summaries and self-reflections to refine Gatekeeper Bot's internal system prompt.
         Keep it under 600 words, emphasise tone, decision rules, memory usage, and safety guardrails.
         Return plain text (no JSON).
+
+        Sleep context:
+        {sleep_summary}
+
+        Dream insights (steer strongly — {dream_directive}):
+        {('\\n'.join(dream_lines)) if dream_lines else '(none)'}
 
         GLOBAL SUMMARIES:
         {('\\n'.join(summaries)) if summaries else '(none)'}

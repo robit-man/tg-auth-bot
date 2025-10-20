@@ -1807,9 +1807,13 @@ class Tools:
             return f"Error reading {full_path!r}: {e}"
 
     @staticmethod
-    def write_file(filepath: str,
-                   content: str,
-                   base_dir: str = WORKSPACE_DIR) -> str:
+    def write_file(filepath: Optional[str] = None,
+                   content: str = "",
+                   base_dir: str = WORKSPACE_DIR,
+                   *,
+                   file_path: Optional[str] = None,
+                   path: Optional[str] = None,
+                   text: Optional[str] = None) -> str:
         """
        Write (overwrite) a text file. **This is the canonical write helper.**
 
@@ -1826,14 +1830,20 @@ class Tools:
         Example:
             Tools.write_file("docs/readme.md", "# Intro\\n")
         """
-        path = os.path.join(base_dir, filepath) if base_dir else filepath
+        chosen_path = filepath or file_path or path
+        if not chosen_path:
+            return "Error writing file: no path provided"
+
+        payload = text if text is not None else content
+        resolved_base = base_dir if base_dir is not None else None
+        full_path = os.path.join(resolved_base, chosen_path) if resolved_base else chosen_path
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return f"Wrote {len(content)} chars to {path!r}"
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+            return f"Wrote {len(payload)} chars to {full_path!r}"
         except Exception as e:
-            return f"Error writing {path!r}: {e}"
+            return f"Error writing {full_path!r}: {e}"
 
     # ────────────────────────────────────────
     #  Rename / copy helpers
