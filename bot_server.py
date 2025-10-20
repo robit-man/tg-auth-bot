@@ -203,7 +203,7 @@ except ImportError as e:
 # Inside venv
 import requests
 from dotenv import load_dotenv, dotenv_values
-from telegram import Update, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity
+from telegram import Update, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity, Message
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -1109,6 +1109,99 @@ def _truncate_for_telegram(text: str, limit: int = 3800) -> str:
     return text[:limit] + "\n\n[truncated]"
 
 
+async def _safe_send_reply(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    *,
+    reply_to: Optional[Message] = None,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+) -> Optional[Message]:
+    cleaned = _truncate_for_telegram(text or "")
+    if not cleaned.strip():
+        cleaned = "⚠️ I couldn't form a reply just now—please try again or rephrase."
+
+    try:
+        if reply_to is not None:
+            return await reply_to.reply_text(cleaned, reply_markup=reply_markup)
+        return await context.bot.send_message(chat_id=chat_id, text=cleaned, reply_markup=reply_markup)
+    except BadRequest:
+        shorter = _truncate_for_telegram(cleaned, 2000)
+        if not shorter.strip():
+            shorter = "⚠️ Response truncated due to platform limits."
+        try:
+            if reply_to is not None:
+                return await reply_to.reply_text(shorter, reply_markup=reply_markup)
+            return await context.bot.send_message(chat_id=chat_id, text=shorter, reply_markup=reply_markup)
+        except Exception as exc:
+            print(f"[reply] failed to send message even after truncation: {exc}")
+            try:
+                return await context.bot.send_message(chat_id=chat_id, text="⚠️ Unable to send full reply; see logs for details.", reply_markup=reply_markup)
+            except Exception:
+                return None
+    except Exception as exc:
+        print(f"[reply] unexpected send failure: {exc}")
+        try:
+            return await context.bot.send_message(chat_id=chat_id, text="⚠️ Unable to send reply due to an error.", reply_markup=reply_markup)
+        except Exception:
+            return None
+
+
+async def _evaluate_reply(
+    user_text: str,
+    draft_reply: str,
+    tool_entries: List[dict],
+    plan_notes: List[str],
+) -> Optional[str]:
+    """
+    Run a lightweight QA pass on the draft reply, incorporating tool/planner context.
+    Returns a short critique string or None if the check should be skipped.
+    """
+    if not ai_available():
+        return None
+
+    tool_summaries = []
+    for entry in tool_entries[:4]:
+        name = entry.get("tool") or "tool"
+        preview = entry.get("result_preview") or ""
+        tool_summaries.append(f"{name}: {preview}")
+
+    planner_section = "\n".join(plan_notes[:3]) if plan_notes else "(none)"
+    tool_section = "\n".join(tool_summaries) if tool_summaries else "(none)"
+
+    prompt = textwrap.dedent(f"""
+        You are Gatekeeper Bot's internal QA critic. Review the draft reply.
+        Provide up to two short bullet points covering potential issues or improvements.
+        Mention if tool outputs or planner notes were not fully addressed and suggest fixes.
+        If everything looks good, respond with "- Looks good." Keep each bullet under 120 characters.
+
+        USER MESSAGE:
+        {user_text}
+
+        DRAFT REPLY:
+        {draft_reply}
+
+        TOOL OUTPUTS:
+        {tool_section}
+
+        PLANNER NOTES:
+        {planner_section}
+    """).strip()
+
+    critique = await ai_generate_async({
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    })
+    critique = _sanitize_internal_blob(critique or "")
+    if not critique:
+        return None
+    lines = [line.strip() for line in critique.splitlines() if line.strip()]
+    critique = "\n".join(lines[:2])
+    critique = critique[:500]
+    return critique
+
+
 async def generate_agentic_reply(
     payload: dict,
     user_id: Optional[int],
@@ -1116,6 +1209,7 @@ async def generate_agentic_reply(
     include_examples: bool = True,
     auto_execute: bool = True,
     max_tools: int = 5,
+    user_text: Optional[str] = None,
 ) -> Tuple[Optional[str], List[Any]]:
     """
     Run the main LLM call, injecting tool context and executing requested tools for admins.
@@ -1163,56 +1257,6 @@ async def generate_agentic_reply(
             parts.append(f"deliverables: {textwrap.shorten(str(deliverables), width=80, placeholder='…')}")
         return " | ".join(filter(None, parts))
 
-    async def _evaluate_reply(
-        user_text: str,
-        draft_reply: str,
-        tool_entries: List[dict],
-        plan_notes: List[str],
-    ) -> Optional[str]:
-        if not ai_available():
-            return None
-
-        tool_summaries = []
-        for entry in tool_entries[:4]:
-            name = entry.get("tool") or "tool"
-            preview = entry.get("result_preview") or ""
-            tool_summaries.append(f"{name}: {preview}")
-
-        planner_section = "\n".join(plan_notes[:3]) if plan_notes else "(none)"
-        tool_section = "\n".join(tool_summaries) if tool_summaries else "(none)"
-
-        prompt = textwrap.dedent(f"""
-            You are Gatekeeper Bot's internal QA critic. Review the draft reply.
-            Provide up to two short bullet points covering potential issues or improvements.
-            Mention if tool outputs or planner notes were not fully addressed and suggest fixes.
-            If everything looks good, respond with "- Looks good." Keep each bullet under 120 characters.
-
-            USER MESSAGE:
-            {user_text}
-
-            DRAFT REPLY:
-            {draft_reply}
-
-            TOOL OUTPUTS:
-            {tool_section}
-
-            PLANNER NOTES:
-            {planner_section}
-        """).strip()
-
-        critique = await ai_generate_async({
-            "model": OLLAMA_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-        })
-        critique = _sanitize_internal_blob(critique or "")
-        if not critique:
-            return None
-        lines = [line.strip() for line in critique.splitlines() if line.strip()]
-        critique = "\n".join(lines[:2])
-        critique = critique[:500]
-        return critique
-
     if tool_access:
         try:
             enhanced_payload = EnhancedPromptBuilder.inject_tool_context(
@@ -1229,6 +1273,60 @@ async def generate_agentic_reply(
     if not response or not tool_access:
         return response, executions
 
+    async def _synthesize_final_reply(
+        user_message: str,
+        draft: str,
+        executed: List[Any],
+    ) -> Optional[str]:
+        if not user_message.strip():
+            return None
+
+        if not executed:
+            # nothing to integrate; keep draft
+            return draft
+
+        summaries = []
+        for result in executed[:4]:
+            tool_name = getattr(result, "tool_name", "tool")
+            output = getattr(result, "result", None)
+            formatted = getattr(result, "formatted_output", None)
+            if tool_name == "plan_complex_task":
+                digest = _summarize_plan_result(output)
+                if digest:
+                    summaries.append(f"{tool_name}: {digest}")
+                    continue
+            if isinstance(output, (dict, list)):
+                try:
+                    snippet = json.dumps(output, ensure_ascii=False)
+                except Exception:
+                    snippet = str(output)
+            else:
+                snippet = formatted or (str(output) if output is not None else getattr(result, "error", ""))
+            if not snippet:
+                snippet = "(no output)"
+            summaries.append(f"{tool_name}: {textwrap.shorten(snippet, width=280, placeholder='…')}")
+
+        prompt = textwrap.dedent(f"""
+            You are Gatekeeper Bot. The user asked:
+            {user_message}
+
+            A draft reply was generated before tool execution:
+            {draft or '(empty)' }
+
+            Tool outputs to incorporate:
+            {chr(10).join('- ' + item for item in summaries) if summaries else '(none)'}
+
+            Produce the final reply for the user. Keep it concise (<= 6 sentences), integrate tool findings, and omit implementation details about tools unless necessary.
+        """).strip()
+
+        final = await ai_generate_async({
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        })
+        final = _sanitize_internal_blob(final or "")
+        return final or draft
+
     try:
         coordinator = ToolExecutionCoordinator(user_id, ADMIN_WHITELIST)  # type: ignore[call-arg]
         modified_response, execution_results = await coordinator.process_ai_response(
@@ -1242,6 +1340,14 @@ async def generate_agentic_reply(
         executions = execution_results
     except Exception as exc:
         print(f"[tools] Failed to process tool executions: {exc}")
+
+    if user_text and tool_access:
+        try:
+            synthesized = await _synthesize_final_reply(user_text, response or "", executions)
+            if synthesized:
+                response = synthesized
+        except Exception as exc:
+            print(f"[tools] Failed to synthesize final reply: {exc}")
 
     return response, executions
 
@@ -4946,6 +5052,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 if plan_digests:
                     plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
+                    plan_section = _truncate_for_telegram(plan_section, 1000)
                     resp = (resp or "").rstrip()
                     resp = f"{resp}\n\n{plan_section}" if resp else plan_section
                 critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
@@ -4969,25 +5076,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if is_admin_user:
                     button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
                 reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
-                try:
-                    reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
-                except BadRequest as exc:
-                    truncated = _truncate_for_telegram(resp)
-                    try:
-                        reply_msg = await m.reply_text(truncated, reply_markup=reply_markup)
-                    except Exception:
-                        reply_msg = await m.reply_text("⚠️ Reply truncated due to length limits.", reply_markup=reply_markup)
-                except Exception:
-                    reply_msg = await m.reply_text("⚠️ Unable to send full reply; see chain log for details.", reply_markup=reply_markup)
+                reply_msg = await _safe_send_reply(
+                    context,
+                    chat.id,
+                    resp,
+                    reply_to=m,
+                    reply_markup=reply_markup,
+                )
                 if debug_enabled and reply_msg:
                     DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
-                        "response": resp,
+                        "response": reply_msg.text,
                         "context": debug_context_text,
                     }
+                sent_text = reply_msg.text if reply_msg else _truncate_for_telegram(resp)
                 reply_message_id = reply_msg.message_id if reply_msg else None
-                log_chain_agent_reply(chat.id, thread_id, resp, tool_entries=tool_summary_entries, message_id=reply_message_id)
+                log_chain_agent_reply(chat.id, thread_id, sent_text, tool_entries=tool_summary_entries, message_id=reply_message_id)
                 asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
-                                                                thread_ctx, text, resp))
+                                                                thread_ctx, text, sent_text))
                 mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
                 if not mood_state:
                     mood_state = get_cached_self_state()
@@ -4996,12 +5101,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                                  decision_meta, complexity_meta,
                                                                  mood_state, thread_ctx, text))
             else:
-                fail_msg = await m.reply_text("AI is unavailable right now (Ollama not responding).")
+                fail_msg = await _safe_send_reply(context, chat.id, "AI is unavailable right now (Ollama not responding).", reply_to=m)
                 if fail_msg:
                     log_chain_agent_reply(chat.id, thread_id, fail_msg.text or "", message_id=fail_msg.message_id)
             return
         else:
-            disabled_msg = await m.reply_text("AI is disabled (set OLLAMA_URL and OLLAMA_MODEL/OLLAMA_EMBED_MODEL in .env).")
+            disabled_msg = await _safe_send_reply(context, chat.id, "AI is disabled (set OLLAMA_URL and OLLAMA_MODEL/OLLAMA_EMBED_MODEL in .env).", reply_to=m)
             if disabled_msg:
                 log_chain_agent_reply(chat.id, thread_id, disabled_msg.text or "", message_id=disabled_msg.message_id)
             return
@@ -5119,8 +5224,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tool_summary_entries = tool_summary
             if plan_digests:
                 plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
-                if len(plan_section) > 1000:
-                    plan_section = _truncate_for_telegram(plan_section, 1000)
+                plan_section = _truncate_for_telegram(plan_section, 1000)
                 resp = (resp or "").rstrip()
                 resp = f"{resp}\n\n{plan_section}" if resp else plan_section
             critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
@@ -5144,26 +5248,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_admin_user:
                 button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
             reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
-            reply_msg = None
-            try:
-                reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
-            except BadRequest as exc:
-                truncated = _truncate_for_telegram(resp)
-                try:
-                    reply_msg = await m.reply_text(truncated, reply_markup=reply_markup)
-                except Exception:
-                    reply_msg = await context.bot.send_message(chat_id=chat.id, text=_truncate_for_telegram(resp, 2000), reply_markup=reply_markup)
-            except Exception:
-                reply_msg = await context.bot.send_message(chat_id=chat.id, text=_truncate_for_telegram(resp, 2000), reply_markup=reply_markup)
+            reply_msg = await _safe_send_reply(
+                context,
+                chat.id,
+                resp,
+                reply_to=m,
+                reply_markup=reply_markup,
+            )
             if debug_enabled and reply_msg:
                 DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
-                    "response": resp,
+                    "response": reply_msg.text,
                     "context": debug_context_text,
                 }
+            sent_text = reply_msg.text if reply_msg else _truncate_for_telegram(resp)
             reply_message_id = reply_msg.message_id if reply_msg else None
-            log_chain_agent_reply(chat.id, thread_id, resp, tool_entries=tool_summary_entries, message_id=reply_message_id)
+            log_chain_agent_reply(chat.id, thread_id, sent_text, tool_entries=tool_summary_entries, message_id=reply_message_id)
             asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
-                                                            thread_ctx, text, resp))
+                                                            thread_ctx, text, sent_text))
             mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
             if not mood_state:
                 mood_state = get_cached_self_state()
@@ -5172,7 +5273,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                              decision_meta, complexity_meta,
                                                              mood_state, thread_ctx, text))
         else:
-            fail_msg = await m.reply_text("I couldn't produce a response just now. Please try again shortly.")
+            fail_msg = await _safe_send_reply(context, chat.id, "I couldn't produce a response just now. Please try again shortly.", reply_to=m)
             if fail_msg:
                 log_chain_agent_reply(chat.id, thread_id, fail_msg.text or "", message_id=fail_msg.message_id)
         return
