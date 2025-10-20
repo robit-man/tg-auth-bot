@@ -66,7 +66,14 @@ def ensure_venv_and_deps():
         "python-dotenv>=1.0,<2.0",
         "requests>=2.31,<3.0",
     ]
-    print("[bootstrap] Installing requirements ...")
+    tool_reqs = [
+        "selenium>=4.17,<5.0",
+        "webdriver-manager>=4.0,<5.0",
+        "beautifulsoup4>=4.12,<5.0",
+        "lxml>=4.9,<6.0",
+        "ollama>=0.1,<1.0",
+    ]
+    print("[bootstrap] Installing core requirements ...")
     subprocess.check_call([py, "-m", "pip", "install", *reqs])
     print("[bootstrap] Re-exec in .venv ...")
     os.execv(py, [py, *sys.argv])
@@ -82,6 +89,72 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
+
+try:
+    from ai_tool_bridge import (
+        TOOL_INTEGRATION_AVAILABLE,
+        TOOLS_AVAILABLE as BRIDGE_TOOLS_AVAILABLE,
+        EnhancedPromptBuilder,
+        ToolExecutionCoordinator,
+    )
+except ImportError:
+    TOOL_INTEGRATION_AVAILABLE = False
+    BRIDGE_TOOLS_AVAILABLE = False
+    EnhancedPromptBuilder = None  # type: ignore
+    ToolExecutionCoordinator = None  # type: ignore
+
+try:
+    from tool_integration import ToolInspector, build_tool_context_for_prompt
+    from tool_schema import ToolSchemaGenerator, ToolFormatter
+    TOOL_SUMMARY_AVAILABLE = True
+    TOOL_SCHEMA_AVAILABLE = True
+except ImportError:
+    ToolInspector = None  # type: ignore
+    build_tool_context_for_prompt = None  # type: ignore
+    ToolSchemaGenerator = None  # type: ignore
+    ToolFormatter = None  # type: ignore
+    TOOL_SUMMARY_AVAILABLE = False
+    TOOL_SCHEMA_AVAILABLE = False
+
+# Intelligent tool routing, RAG, and vision
+try:
+    from tool_router import IntelligentToolRouter, RouteType, RouteDecision
+    from document_rag import DocumentRAGStore
+    from vision_handler import VisionHandler
+    INTELLIGENT_ROUTING_AVAILABLE = True
+except ImportError:
+    IntelligentToolRouter = None  # type: ignore
+    RouteType = None  # type: ignore
+    RouteDecision = None  # type: ignore
+    DocumentRAGStore = None  # type: ignore
+    VisionHandler = None  # type: ignore
+    INTELLIGENT_ROUTING_AVAILABLE = False
+
+# Real tool execution with UI
+try:
+    from tool_executor_bridge import (
+        ToolDecisionMaker,
+        RealToolExecutor,
+        ToolDecision as RealToolDecision,
+        ToolDecisionType,
+        decide_and_execute_tool,
+    )
+    from tool_telegram_ui import (
+        ToolTelegramUI,
+        handle_tool_confirmation_callback,
+        handle_rating_callback,
+    )
+    REAL_TOOL_EXECUTION_AVAILABLE = True
+except ImportError:
+    ToolDecisionMaker = None  # type: ignore
+    RealToolExecutor = None  # type: ignore
+    RealToolDecision = None  # type: ignore
+    ToolDecisionType = None  # type: ignore
+    decide_and_execute_tool = None  # type: ignore
+    ToolTelegramUI = None  # type: ignore
+    handle_tool_confirmation_callback = None  # type: ignore
+    handle_rating_callback = None  # type: ignore
+    REAL_TOOL_EXECUTION_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────
 # 1) .env + config (auto-detect Ollama models)
@@ -1002,13 +1075,35 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = textwrap.dedent(f"""
         ✅ Gating enabled for *{chat.title}*.
 
-        1) Group default is now read-only.
-        2) Pin this “Start” link so newcomers can unlock:
-           {start_link}
+def extract_triples_with_llm(snippet: str) -> List[dict]:
+    prompt = textwrap.dedent(f"""
+        Extract 1-6 triples SUBJECT|RELATION|OBJECT as JSON lines {{"s":"","r":"","o":""}}.
+        Keep concrete and non-speculative.
 
-        Primary server chat id: `{PRIMARY_CHAT_ID}`
+        Snippet:
+        {snippet}
     """).strip()
-    await update.effective_message.reply_text(msg, disable_web_page_preview=True, parse_mode="Markdown")
+    try:
+        r = requests.post(OLLAMA_URL + "/api/chat",
+                          json={"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False},
+                          timeout=40)
+        r.raise_for_status()
+        data = r.json() or {}
+        content = (data.get("message") or {}).get("content") or ""
+    except Exception:
+        return []
+    triples = []
+    for line in content.splitlines():
+        line=line.strip().strip(",; ")
+        if not (line.startswith("{") and line.endswith("}")): continue
+        try:
+            obj=json.loads(line)
+            s=(obj.get("s") or obj.get("subject") or "").strip()
+            r_=(obj.get("r") or obj.get("relation") or "").strip()
+            o=(obj.get("o") or obj.get("object") or "").strip()
+            if s and r_ and o: triples.append({"s":s[:120],"r":r_[:60],"o":o[:120]})
+        except Exception: pass
+    return triples[:6]
 
 @admin_only
 async def ungate(update: Update, context: ContextTypes.DEFAULT_TYPE):

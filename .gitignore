@@ -1,0 +1,6 @@
+.claude
+.venv
+__*
+data
+.env
+*.db*
