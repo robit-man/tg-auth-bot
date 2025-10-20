@@ -1767,13 +1767,19 @@ class Tools:
         return out
 
     @staticmethod
-    def read_file(filepath: str,
-                  base_dir: str = WORKSPACE_DIR) -> str:
+    def read_file(filepath: Optional[str] = None,
+                  base_dir: str = WORKSPACE_DIR,
+                  *,
+                  file_path: Optional[str] = None,
+                  path: Optional[str] = None) -> str:
         """
        Read a single text file.
 
         Args:
-            filepath (str, required): Absolute path **or** path relative to `base_dir`.
+            filepath (str, optional): Absolute path **or** path relative to `base_dir`.
+                Backwards-compatible primary argument.
+            file_path/path (str, optional): Accepted aliases for callers that use
+                snake_case variants (e.g., tool schemas).
             base_dir (str | None, optional): If provided, `filepath` is resolved
                 under it.
 
@@ -1784,12 +1790,21 @@ class Tools:
         Example:
             body = Tools.read_file("notes/poem.txt", Tools.WORKSPACE_DIR)
         """
-        path = os.path.join(base_dir, filepath) if base_dir else filepath
+        chosen = filepath or file_path or path
+        if not chosen:
+            return "Error reading file: no path provided"
+
+        resolved_base = base_dir
+        if path and not filepath and not file_path:
+            # When caller passed `path` only, treat it as the target and do not join twice.
+            resolved_base = base_dir
+
+        full_path = os.path.join(resolved_base, chosen) if resolved_base else chosen
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(full_path, "r", encoding="utf-8") as f:
                 return f.read()
         except Exception as e:
-            return f"Error reading {path!r}: {e}"
+            return f"Error reading {full_path!r}: {e}"
 
     @staticmethod
     def write_file(filepath: str,

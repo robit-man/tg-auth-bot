@@ -12,7 +12,7 @@ Python 3.10+
 # BOOTSTRAP: STDLIB IMPORTS ONLY
 # ──────────────────────────────────────────────────────────────
 import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, math, random, asyncio, socket, threading, queue, traceback, glob, html
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from contextlib import closing
 from functools import wraps, lru_cache
@@ -499,6 +499,143 @@ MAX_CONTEXT_GROUPS = int(os.getenv("MAX_CONTEXT_GROUPS") or 30)
 
 DEBUG_FLAGS: Dict[int, bool] = defaultdict(bool)
 DEBUG_CONTEXTS: Dict[tuple[int, int], Dict[str, str]] = {}
+
+CHAIN_LOG_MAX_LEN = 16
+CHAIN_LOGS: Dict[tuple[int, int], deque[dict]] = {}
+
+
+def _chain_key(chat_id: int, thread_id: int | None) -> tuple[int, int]:
+    return (int(chat_id), int(thread_id or 0))
+
+
+def _get_chain_log(chat_id: int, thread_id: int | None) -> deque[dict]:
+    key = _chain_key(chat_id, thread_id)
+    dq = CHAIN_LOGS.get(key)
+    if dq is None:
+        dq = deque(maxlen=CHAIN_LOG_MAX_LEN)
+        CHAIN_LOGS[key] = dq
+    return dq
+
+
+def _shorten_for_chain(text: str, limit: int = 320) -> str:
+    snippet = (text or "").strip().replace("\r", " ").replace("\n", " ")
+    if len(snippet) <= limit:
+        return snippet or "(empty)"
+    return snippet[: limit - 1] + "…"
+
+
+def _condense_tool_entries(tool_entries: Optional[Iterable[Any]]) -> List[str]:
+    lines: List[str] = []
+    if not tool_entries:
+        return lines
+    for item in tool_entries:
+        name = ""
+        state = ""
+        preview = ""
+        if isinstance(item, dict):
+            name = str(item.get("tool") or item.get("tool_name") or "")
+            state = str(item.get("state") or item.get("status") or "")
+            preview = str(item.get("result_preview") or item.get("result") or "")
+        else:
+            name = str(getattr(item, "tool_name", ""))
+            state_obj = getattr(item, "state", None)
+            state = str(getattr(state_obj, "value", state_obj) or "")
+            preview = str(getattr(item, "result", "") or "")
+        if preview:
+            preview = _shorten_for_chain(preview, limit=96)
+        line = name or "tool"
+        if state:
+            line += f" ({state})"
+        if preview:
+            line += f": {preview}"
+        lines.append(line)
+        if len(lines) >= 4:
+            break
+    return lines
+
+
+def log_chain_user_message(chat_id: int, thread_id: int | None, text: str, *, user_id: Optional[int] = None, message_id: Optional[int] = None) -> None:
+    if not text:
+        return
+    entry = {
+        "user": _shorten_for_chain(text),
+        "user_raw": text,
+        "user_id": user_id,
+        "user_message_id": message_id,
+        "ts": time.time(),
+    }
+    dq = _get_chain_log(chat_id, thread_id)
+    dq.append(entry)
+
+
+def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, tool_entries: Optional[Iterable[Any]] = None, message_id: Optional[int] = None) -> None:
+    if not text:
+        return
+    response_data = {
+        "assistant": _shorten_for_chain(text),
+        "assistant_raw": text,
+        "assistant_message_id": message_id,
+        "tools": _condense_tool_entries(tool_entries),
+        "ts": time.time(),
+    }
+    dq = _get_chain_log(chat_id, thread_id)
+    if dq and "assistant" not in dq[-1]:
+        dq[-1].update(response_data)
+    else:
+        dq.append(response_data)
+
+
+def build_chain_summary(chat_id: int, thread_id: int | None, limit: int = 5) -> str:
+    dq = CHAIN_LOGS.get(_chain_key(chat_id, thread_id))
+    if not dq:
+        return "🧾 <b>Recent exchanges</b>\n(no entries recorded yet)"
+
+    entries = list(dq)
+    subset = entries[-limit:]
+    start_idx = max(1, len(entries) - len(subset) + 1)
+    lines = ["🧾 <b>Recent exchanges</b>"]
+
+    for offset, entry in enumerate(subset, start=start_idx):
+        lines.append(f"{offset}.")
+        user_text = entry.get("user")
+        if user_text:
+            lines.append(f"  👤 <code>{html.escape(user_text)}</code>")
+        assistant_text = entry.get("assistant")
+        if assistant_text:
+            lines.append(f"  🤖 <code>{html.escape(assistant_text)}</code>")
+        tool_lines = entry.get("tools") or []
+        if tool_lines:
+            tool_str = "; ".join(html.escape(t) for t in tool_lines)
+            lines.append(f"  🛠️ {tool_str}")
+
+    return "\n".join(lines)
+
+
+def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 4, max_chars: int = 900) -> str:
+    dq = CHAIN_LOGS.get(_chain_key(chat_id, thread_id))
+    if not dq:
+        return "(no recent turns logged)"
+
+    entries = list(dq)[-limit:]
+    lines: List[str] = []
+    total = 0
+    for idx, entry in enumerate(entries, start=1):
+        user_raw = entry.get("user_raw") or entry.get("user") or ""
+        asst_raw = entry.get("assistant_raw") or entry.get("assistant") or ""
+        user_line = f"{idx}. USER: {user_raw}"
+        bot_line = f"{idx}. BOT: {asst_raw}" if asst_raw else ""
+
+        for line in (user_line, bot_line):
+            if not line:
+                continue
+            snippet = textwrap.shorten(line, width=220, placeholder=" …")
+            if total + len(snippet) + 1 > max_chars:
+                lines.append("… (truncated)")
+                return "\n".join(lines)
+            lines.append(snippet)
+            total += len(snippet) + 1
+
+    return "\n".join(lines) if lines else "(no recent turns logged)"
 
 # ──────────────────────────────────────────────────────────────
 # 2) Paths + shard dirs
@@ -1386,6 +1523,7 @@ def command_catalog() -> Dict[str, List[tuple]]:
         ("/graph [here|server] [N]", "Show KG relations."),
         ("/autosystem [why]", "Regenerate the system prompt."),
         ("/tools", "List available tool functions exposed to the AI."),
+        ("/chain", "Show recent user↔agent exchanges for this chat/thread."),
         ("/plan <objective>", "Delegate a complex multi-step task to the autonomous planner."),
     ]
     return {"public": public, "admin": admin}
@@ -1429,6 +1567,17 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(format_commands_for_user(is_admin))
 
 
+@whitelist_only
+async def chain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    message = update.effective_message
+    if not chat or not message:
+        return
+    thread_id = getattr(message, "message_thread_id", None) or 0
+    summary = build_chain_summary(chat.id, thread_id, limit=8)
+    await message.reply_html(summary, disable_web_page_preview=True)
+
+
 async def debug_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not query.message:
@@ -1458,6 +1607,34 @@ async def debug_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(new_text, reply_markup=markup)
     except Exception:
         await query.answer("Unable to update message.", show_alert=True)
+        return
+    await query.answer()
+
+
+async def chain_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    user = query.from_user
+    if user and user.id not in ADMIN_WHITELIST:
+        await query.answer("Admins only.", show_alert=True)
+        return
+    chat = query.message.chat
+    if not chat:
+        await query.answer()
+        return
+    thread_id = getattr(query.message, "message_thread_id", None) or 0
+    summary = build_chain_summary(chat.id, thread_id, limit=6)
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=summary,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_to_message_id=query.message.message_id,
+        )
+    except Exception:
+        await query.answer("Unable to send chain summary.", show_alert=True)
         return
     await query.answer()
 
@@ -2435,6 +2612,7 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
     )
     graph_here = "\n".join(kg_snapshot.get("rels_here", [])[:10]) or "(none)"
     ents_here = "\n".join(kg_snapshot.get("ents_here", [])[:10]) or "(none)"
+    recent_dialogue = format_recent_dialogue(chat_id, thread_id, limit=4, max_chars=800)
     blended = f"SIMILAR_CHANNEL:\n{similar_blend.get('channel') or '(none)'}\n\nSIMILAR_SERVER:\n{similar_blend.get('server') or '(none)'}\n\nSIMILAR_GLOBAL:\n{similar_blend.get('global') or '(none)'}"
     state_blob = internal_state or {}
     narrative = (state_blob.get("narrative") or "").strip()
@@ -2558,6 +2736,9 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
         {ents_here}
           Top relations:
         {graph_here}
+
+        RECENT_DIALOGUE (latest to oldest):
+        {recent_dialogue}
 
         THREAD_CONTEXT (recent here):
         {thread_ctx or '(none)'}
@@ -4330,6 +4511,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (m.text or "").strip()
         if not text: return
         thread_id = 0
+        log_chain_user_message(chat.id, thread_id, text, user_id=user.id if user else None, message_id=m.message_id)
 
         # Try real tool execution first (for admin users)
         if REAL_TOOL_EXECUTION_AVAILABLE and user and user.id in ADMIN_WHITELIST:
@@ -4405,6 +4587,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     max_tools=max_tools_allowed,
                 ),
             )
+            tool_summary_entries: List[dict] = []
             if resp:
                 if tool_runs:
                     tool_summary = []
@@ -4424,9 +4607,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             }
                         )
                     complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
+                    tool_summary_entries = tool_summary
                 debug_enabled = DEBUG_FLAGS.get(chat.id, False)
                 debug_context_text = ""
-                reply_markup = None
+                button_row: List[InlineKeyboardButton] = []
                 if debug_enabled:
                     debug_context_text = build_debug_context_text(
                         text,
@@ -4438,15 +4622,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         tool_runs,
                         decision_meta,
                     )
-                    reply_markup = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("Show context", callback_data="debug:show")]]
-                    )
+                    button_row.append(InlineKeyboardButton("Show context", callback_data="debug:show"))
+                if is_admin_user:
+                    button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
+                reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
                 reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
                 if debug_enabled and reply_msg:
                     DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
                         "response": resp,
                         "context": debug_context_text,
                     }
+                reply_message_id = reply_msg.message_id if reply_msg else None
+                log_chain_agent_reply(chat.id, thread_id, resp, tool_entries=tool_summary_entries, message_id=reply_message_id)
                 asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
                                                                 thread_ctx, text, resp))
                 mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
@@ -4457,10 +4644,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                                  decision_meta, complexity_meta,
                                                                  mood_state, thread_ctx, text))
             else:
-                await m.reply_text("AI is unavailable right now (Ollama not responding).")
+                fail_msg = await m.reply_text("AI is unavailable right now (Ollama not responding).")
+                if fail_msg:
+                    log_chain_agent_reply(chat.id, thread_id, fail_msg.text or "", message_id=fail_msg.message_id)
             return
         else:
-            return await m.reply_text("AI is disabled (set OLLAMA_URL and OLLAMA_MODEL/OLLAMA_EMBED_MODEL in .env).")
+            disabled_msg = await m.reply_text("AI is disabled (set OLLAMA_URL and OLLAMA_MODEL/OLLAMA_EMBED_MODEL in .env).")
+            if disabled_msg:
+                log_chain_agent_reply(chat.id, thread_id, disabled_msg.text or "", message_id=disabled_msg.message_id)
+            return
 
     # Groups/channels: respond on @mention/reply, else maybe (smart)
     text = (m.text or "").strip()
@@ -4496,6 +4688,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 0.5,
                 rel_meta
             ))
+    log_chain_user_message(chat.id, thread_id, text, user_id=user.id if user else None, message_id=m.message_id)
     thread_ctx = fetch_thread_context(chat.id, thread_id, limit=24)
     internal_state = await recall_memories_async(text, chat, thread_id, user)
     must = mentions_bot(m) or (getattr(m,"reply_to_message",None) and m.reply_to_message.from_user and m.reply_to_message.from_user.id == BOT_CACHE["id"])
@@ -4538,6 +4731,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 max_tools=max_tools_allowed,
             ),
         )
+        tool_summary_entries: List[dict] = []
         if resp:
             if tool_runs:
                 tool_summary = []
@@ -4557,9 +4751,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         }
                     )
                 complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
+                tool_summary_entries = tool_summary
             debug_enabled = DEBUG_FLAGS.get(chat.id, False)
             debug_context_text = ""
-            reply_markup = None
+            button_row: List[InlineKeyboardButton] = []
             if debug_enabled:
                 debug_context_text = build_debug_context_text(
                     text,
@@ -4571,9 +4766,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     tool_runs,
                     decision_meta,
                 )
-                reply_markup = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Show context", callback_data="debug:show")]]
-                )
+                button_row.append(InlineKeyboardButton("Show context", callback_data="debug:show"))
+            if is_admin_user:
+                button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
+            reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
             reply_msg = None
             try:
                 reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
@@ -4584,6 +4780,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "response": resp,
                     "context": debug_context_text,
                 }
+            reply_message_id = reply_msg.message_id if reply_msg else None
+            log_chain_agent_reply(chat.id, thread_id, resp, tool_entries=tool_summary_entries, message_id=reply_message_id)
             asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
                                                             thread_ctx, text, resp))
             mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
@@ -4593,7 +4791,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(maybe_trigger_breakout_event(context, chat, user, thread_id,
                                                              decision_meta, complexity_meta,
                                                              mood_state, thread_ctx, text))
-            return
+        else:
+            fail_msg = await m.reply_text("I couldn't produce a response just now. Please try again shortly.")
+            if fail_msg:
+                log_chain_agent_reply(chat.id, thread_id, fail_msg.text or "", message_id=fail_msg.message_id)
+        return
 
 # ──────────────────────────────────────────────────────────────
 # 17) Unlock flow + greetings
@@ -4921,6 +5123,7 @@ def main():
     app.add_handler(CommandHandler("autosystem", autosystem_cmd))
     app.add_handler(CommandHandler("debug", debug_cmd))
     app.add_handler(CommandHandler("tools", tools_cmd))
+    app.add_handler(CommandHandler("chain", chain_cmd))
     app.add_handler(CommandHandler("plan", plan_cmd))
 
     # Profiles (DM)
@@ -4930,6 +5133,7 @@ def main():
     app.add_handler(CommandHandler("setadmin", setadmin_cmd))
     app.add_handler(CallbackQueryHandler(adminreq_cb, pattern=r"^adminreq:(approve|deny):\d+$"))
     app.add_handler(CallbackQueryHandler(debug_toggle_cb, pattern=r"^debug:(show|hide)$"))
+    app.add_handler(CallbackQueryHandler(chain_cb, pattern=r"^chain:show$"))
 
     # Tool execution callbacks (confirmation and rating)
     if REAL_TOOL_EXECUTION_AVAILABLE:
