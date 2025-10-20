@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable
@@ -70,6 +71,40 @@ class ToolExecutionResult:
     output: Any
     error: Optional[str] = None
     execution_time: float = 0.0
+
+
+def _summarize_plan_output(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+
+    success = bool(data.get("success", True))
+    summary = data.get("summary") or {}
+    objective = data.get("objective") or (data.get("plan") or {}).get("objective")
+    steps = (data.get("plan") or {}).get("steps") or []
+    deliverables = data.get("deliverables")
+
+    total_steps = summary.get("total_steps") if isinstance(summary, dict) else None
+    successes = summary.get("successes") if isinstance(summary, dict) else None
+    failures = summary.get("failures") if isinstance(summary, dict) else []
+
+    status_icon = "✅" if success else "⚠️"
+    parts: List[str] = [f"{status_icon} planner {'completed' if success else 'needs review'}"]
+    if objective:
+        parts.append(f"objective: {textwrap.shorten(str(objective), width=80, placeholder='…')}")
+    if total_steps is not None and successes is not None:
+        parts.append(f"steps {successes}/{total_steps}")
+    if failures:
+        fail_labels = ", ".join(str(f) for f in failures[:3])
+        parts.append(f"failed: {fail_labels}")
+    if deliverables:
+        parts.append(f"deliverables: {textwrap.shorten(str(deliverables), width=80, placeholder='…')}")
+    step_titles = [
+        textwrap.shorten(str(step.get("title") or step.get("id") or ""), width=60, placeholder="…")
+        for step in steps[:3] if isinstance(step, dict)
+    ]
+    if step_titles:
+        parts.append("key steps: " + "; ".join(step_titles))
+    return " | ".join(parts)
 
 
 class IntelligentToolRouter:
@@ -220,6 +255,14 @@ class IntelligentToolRouter:
         ]):
             scores[RouteType.TOOL_EXECUTION] += 1.5
 
+        planning_triggers = [
+            "plan", "multi-step", "multi step", "roadmap", "strategy",
+            "workflow", "sequence", "pipeline", "project plan", "long task",
+            "break down", "step by step"
+        ]
+        if any(kw in msg_lower for kw in planning_triggers) or len(user_message) > 220:
+            scores[RouteType.TOOL_EXECUTION] += 2.0
+
         # Default: direct answer gets small boost if nothing else matches
         if sum(scores.values()) < 0.5:
             scores[RouteType.DIRECT_ANSWER] = 0.8
@@ -353,6 +396,18 @@ Return JSON with scores for each route (0.0 to 1.0):
             if "describe_image" in self.available_tools:
                 tools_needed.append("describe_image")
 
+        elif route == RouteType.TOOL_EXECUTION:
+            if "plan_complex_task" in self.available_tools:
+                plan_keywords = [
+                    "plan", "roadmap", "strategy", "multi-step", "multi step",
+                    "workflow", "project plan", "long project", "break down", "step by step"
+                ]
+                if any(kw in msg_lower for kw in plan_keywords) or len(user_message) > 220:
+                    tools_needed.append("plan_complex_task")
+            # fall back to read/write heuristics to allow combined execution
+            if "read_file" in self.available_tools and "read" in msg_lower:
+                tools_needed.append("read_file")
+
         return tools_needed
 
     async def execute_route(
@@ -438,6 +493,11 @@ Return JSON with scores for each route (0.0 to 1.0):
                 params["file_path"] = match.group(1)
             # Content would need to be extracted separately
 
+        elif tool_name == "plan_complex_task":
+            params["objective"] = user_message.strip()
+            params["constraints"] = None
+            params["deliverables"] = None
+
         return params
 
     def _build_response_from_results(
@@ -462,6 +522,11 @@ Return JSON with scores for each route (0.0 to 1.0):
         response_parts = []
         for result in results:
             if result.output:
+                if result.tool_name == "plan_complex_task":
+                    digest = _summarize_plan_output(result.output)
+                    if digest:
+                        response_parts.append(f"[{result.tool_name}]\n{digest}")
+                        continue
                 response_parts.append(f"[{result.tool_name}]\n{result.output}")
 
         return "\n\n".join(response_parts) if response_parts else "Tools executed successfully (no output)"

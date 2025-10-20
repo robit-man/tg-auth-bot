@@ -601,17 +601,16 @@ def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, too
         dq.append(response_data)
 
 
-def build_chain_summary(chat_id: int, thread_id: int | None, limit: int = 5) -> str:
+def build_chain_summary(chat_id: int, thread_id: int | None, limit: int = 10) -> str:
     dq = CHAIN_LOGS.get(_chain_key(chat_id, thread_id))
     if not dq:
         return "🧾 <b>Recent exchanges</b>\n(no entries recorded yet)"
 
     entries = list(dq)
     subset = entries[-limit:]
-    start_idx = max(1, len(entries) - len(subset) + 1)
     lines = ["🧾 <b>Recent exchanges</b>"]
 
-    for offset, entry in enumerate(subset, start=start_idx):
+    for offset, entry in enumerate(reversed(subset), start=1):
         lines.append(f"{offset}.")
         user_text = entry.get("user")
         if user_text:
@@ -627,7 +626,7 @@ def build_chain_summary(chat_id: int, thread_id: int | None, limit: int = 5) -> 
     return "\n".join(lines)
 
 
-def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 4, max_chars: int = 900) -> str:
+def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 8, max_chars: int = 1200) -> str:
     dq = CHAIN_LOGS.get(_chain_key(chat_id, thread_id))
     if not dq:
         return "(no recent turns logged)"
@@ -635,7 +634,7 @@ def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 
     entries = list(dq)[-limit:]
     lines: List[str] = []
     total = 0
-    for idx, entry in enumerate(entries, start=1):
+    for idx, entry in enumerate(reversed(entries), start=1):
         user_raw = entry.get("user_raw") or entry.get("user") or ""
         asst_raw = entry.get("assistant_raw") or entry.get("assistant") or ""
         user_line = f"{idx}. USER: {user_raw}"
@@ -644,7 +643,16 @@ def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 
         for line in (user_line, bot_line):
             if not line:
                 continue
-            snippet = textwrap.shorten(line, width=220, placeholder=" …")
+            snippet = textwrap.shorten(line, width=260, placeholder=" …")
+            if total + len(snippet) + 1 > max_chars:
+                lines.append("… (truncated)")
+                return "\n".join(lines)
+            lines.append(snippet)
+            total += len(snippet) + 1
+
+        for tool_entry in entry.get("tools") or []:
+            tool_line = f"    🛠️ {tool_entry}"
+            snippet = textwrap.shorten(tool_line, width=240, placeholder=" …")
             if total + len(snippet) + 1 > max_chars:
                 lines.append("… (truncated)")
                 return "\n".join(lines)
@@ -4724,15 +4732,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         state_obj = getattr(run, "state", None)
                         state_val = getattr(state_obj, "value", state_obj)
                         result_obj = getattr(run, "result", None)
+                        preview_txt = "(None)" if result_obj is None else str(result_obj)
                         if getattr(run, "tool_name", "") == "plan_complex_task":
                             plan_tool_seen = True
                             digest = _summarize_plan_result(result_obj)
                             if digest:
                                 plan_digests.append(digest)
-                        if result_obj is None:
-                            preview_txt = "(None)"
-                        else:
-                            preview_txt = str(result_obj)
+                                preview_txt = digest
                         tool_summary.append(
                             {
                                 "tool": getattr(run, "tool_name", ""),
@@ -4756,11 +4762,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             digest = _summarize_plan_result(auto_plan_result)
                             if digest:
                                 plan_digests.append(digest)
+                                preview_value = digest
+                                plan_tool_seen = True
+                            else:
+                                preview_value = textwrap.shorten(str(auto_plan_result), width=200, placeholder="…")
+                                plan_tool_seen = True
                             tool_summary.append(
                                 {
                                     "tool": "plan_complex_task",
                                     "state": "auto",
-                                    "result_preview": textwrap.shorten(str(auto_plan_result), width=200, placeholder="…"),
+                                    "result_preview": preview_value,
                                 }
                             )
                     except Exception as exc:
@@ -4906,14 +4917,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     state_obj = getattr(run, "state", None)
                     state_val = getattr(state_obj, "value", state_obj)
                     result_obj = getattr(run, "result", None)
+                    preview_txt = "(None)" if result_obj is None else str(result_obj)
                     if getattr(run, "tool_name", "") == "plan_complex_task":
                         digest = _summarize_plan_result(result_obj)
                         if digest:
                             plan_digests.append(digest)
-                    if result_obj is None:
-                        preview_txt = "(None)"
-                    else:
-                        preview_txt = str(result_obj)
+                            preview_txt = digest
                     tool_summary.append(
                         {
                             "tool": getattr(run, "tool_name", ""),
