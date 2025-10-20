@@ -279,10 +279,6 @@ class EnhancedPromptBuilder:
         if not TOOL_INTEGRATION_AVAILABLE or not TOOLS_AVAILABLE:
             return base_prompt
 
-        # Only add tool context for admin users
-        if user_id not in admin_whitelist:
-            return base_prompt
-
         # Build tool context
         tool_context = build_tool_context_for_prompt(user_id, admin_whitelist, include_examples)
 
@@ -353,10 +349,6 @@ class ToolExecutionCoordinator:
             Tuple of (modified_response, execution_results)
         """
         if not TOOL_INTEGRATION_AVAILABLE or not TOOLS_AVAILABLE:
-            return ai_response, []
-
-        # Only allow tool execution for admin users
-        if self.user_id not in self.admin_whitelist:
             return ai_response, []
 
         modified_response = ai_response

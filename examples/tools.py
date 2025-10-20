@@ -68,7 +68,6 @@ from cognition import CognitionChat, CognitionConfig
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = str(SCRIPT_DIR)  # <-- added default workspace root
-WORKSPACE_ROOT = Path(WORKSPACE_DIR).resolve()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Autonomous search agent prompts & schemas
@@ -241,20 +240,6 @@ class Tools:
     @staticmethod
     def runtime_tool_functions() -> Dict[str, Callable[..., Any]]:
         return dict(Tools._runtime_tools)
-
-    @staticmethod
-    def _resolve_workspace_path(rel_path: str,
-                                base_dir: str = WORKSPACE_DIR) -> Path:
-        """
-        Resolve a path relative to the workspace and ensure it does not escape.
-        """
-        base = Path(base_dir).resolve()
-        dest = (base / rel_path).resolve()
-        try:
-            dest.relative_to(WORKSPACE_ROOT)
-        except ValueError as exc:
-            raise ValueError(f"path '{rel_path}' escapes workspace root") from exc
-        return dest
 
     @staticmethod
     def _find_system_chromedriver() -> str | None:
@@ -861,7 +846,6 @@ class Tools:
                         extract_system: Optional[str] = None,
                         stream_aux: bool = True,
                         retain_browser: bool = False,
-                        progress_callback: Optional[callable] = None,
                         **kwargs) -> list:
         """
         DuckDuckGo search → open top results → capture DOM (browser) → optional bs4 fallback →
@@ -901,14 +885,6 @@ class Tools:
         except Exception:
             wait_sec = 1
 
-        # Helper to send progress updates
-        def _progress(message: str):
-            if progress_callback:
-                try:
-                    progress_callback(message)
-                except Exception as e:
-                    log_message(f"[search_internet] progress callback error: {e}", "WARNING")
-
         # ---- Build SYSTEM prompts derived from the topic ------------------------
         def _summary_system(t: str) -> str:
             return (
@@ -944,7 +920,6 @@ class Tools:
                 return Tools.auxiliary_inference(prompt=prompt, system=system, temperature=temperature)
 
         # ---- Fresh browser session (GUI by default) -----------------------------
-        _progress(f"🌐 Opening browser (GUI mode)...")
         if not retain_browser:
             Tools.close_browser()
         Tools.open_browser(headless=headless, force_new=True)
@@ -955,11 +930,9 @@ class Tools:
         serp_url = "https://duckduckgo.com/"
         try:
             # Home
-            _progress(f"🔍 Navigating to DuckDuckGo...")
             drv.get(serp_url)
             wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
             log_message("[search_internet] Home page ready.", "DEBUG")
-            _progress(f"✓ DuckDuckGo loaded")
 
             # Cookie banner (best effort)
             try:
@@ -987,7 +960,6 @@ class Tools:
                 raise RuntimeError("Search box not found!")
 
             # Submit query
-            _progress(f"⌨️ Typing search query: '{t_topic}'")
             drv.execute_script(
                 "arguments[0].value = arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input'));"
@@ -995,32 +967,27 @@ class Tools:
                 box, t_topic
             )
             log_message("[search_internet] Query submitted.", "DEBUG")
-            _progress(f"🔎 Submitting search...")
 
             # Wait for results
             try:
                 wait.until(lambda d: "?q=" in d.current_url)
                 wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#links .result, #links [data-nr]"))
                 log_message("[search_internet] Results detected.", "DEBUG")
-                _progress(f"✓ Search results received")
             except TimeoutException:
                 log_message("[search_internet] Results timeout; proceeding with whatever is visible.", "WARNING")
-                _progress(f"⚠️ Slow response, proceeding with visible results")
 
             # Top anchors
             anchors = drv.find_elements(
                 By.CSS_SELECTOR,
                 "a.result__a, a[data-testid='result-title-a']"
             )[: int(num_results)]
-            _progress(f"📋 Found {len(anchors)} results, processing each...")
 
             main_handle = drv.current_window_handle
 
-            for idx, a in enumerate(anchors, 1):
+            for a in anchors:
                 try:
                     href = a.get_attribute("href")
                     title = a.text.strip() or html.unescape(drv.execute_script("return arguments[0].innerText;", a))
-                    _progress(f"\n📄 Result {idx}/{len(anchors)}: {title[:60]}...")
 
                     # snippet (best effort)
                     try:
@@ -1035,19 +1002,15 @@ class Tools:
 
                     # ---- Deep scrape in new tab (primary: capture DOM) -----------
                     if deep_scrape and href:
-                        _progress(f"🌐 Opening page in new tab: {href[:50]}...")
                         drv.switch_to.new_window("tab")
                         TAB_DEADLINE = time.time() + 12
                         drv.set_page_load_timeout(12)
                         try:
                             drv.get(href)
-                            _progress(f"⏳ Page loading...")
                         except TimeoutException:
                             log_message(f"[search_internet] page-load timeout for {href!r}", "WARNING")
-                            _progress(f"⚠️ Page load timeout, capturing partial content")
 
                         # Allow JS to settle a bit; watch for lull
-                        _progress(f"⏱️ Waiting for page to stabilize (JavaScript execution)...")
                         drv.execute_script("""
                             window._lastMut = Date.now();
                             try {
@@ -1069,15 +1032,12 @@ class Tools:
                             time.sleep(0.12)
 
                         # Capture DOM BEFORE closing tab
-                        _progress(f"📸 Capturing page DOM and extracting text...")
                         try:
                             final_url = drv.current_url or href
                             html_dom = drv.execute_script("return document.documentElement.outerHTML;")
                             page_content = html_dom if bs4_verbose else Tools._visible_text_from_html(html_dom)
-                            _progress(f"✓ Captured {len(page_content)} characters from page")
                         except Exception as e:
                             log_message(f"[search_internet] DOM capture failed: {e}", "WARNING")
-                            _progress(f"❌ DOM capture failed: {e}")
 
                         # Close tab & switch back
                         try:
@@ -1085,7 +1045,6 @@ class Tools:
                         except Exception:
                             pass
                         drv.switch_to.window(main_handle)
-                        _progress(f"🔙 Returned to search results")
 
                         # Fallback: if empty (blocked, JS empty shell), use obfuscated bs4 fetch with cookies
                         if not page_content:
@@ -1120,7 +1079,6 @@ class Tools:
                     aux_summary = ""
                     if summarize and body_for_llm:
                         try:
-                            _progress(f"🤖 Generating AI summary of page content...")
                             aux_prompt = f"{body_for_llm}"
                             log_message("[search_internet] aux summary (stream)", "DEBUG")
                             aux_summary = _aux_call(
@@ -1128,16 +1086,13 @@ class Tools:
                                 system=_summary_system(t_topic),
                                 stream=stream_aux,
                             )
-                            _progress(f"✓ Summary generated ({len(aux_summary)} chars)")
                         except Exception as ex:
                             log_message(f"[search_internet] auxiliary_inference summary error: {ex}", "WARNING")
-                            _progress(f"⚠️ Summary generation failed: {ex}")
 
                     # ---- Topic-focused targeted extraction (optional) ------------
                     extracted = ""
                     if extract and body_for_llm:
                         try:
-                            _progress(f"🔍 Extracting key information for topic: '{t_topic}'...")
                             sys_for_extract = extract_system or _extract_system_from_topic(t_topic)
                             log_message("[search_internet] targeted extraction (stream)", "DEBUG")
                             extracted = _aux_call(
@@ -1146,10 +1101,8 @@ class Tools:
                                 temperature=0.2,
                                 stream=stream_aux,
                             )
-                            _progress(f"✓ Extracted key information ({len(extracted)} chars)")
                         except Exception as ex:
                             log_message(f"[search_internet] auxiliary_inference extraction error: {ex}", "WARNING")
-                            _progress(f"⚠️ Extraction failed: {ex}")
 
                     # Basic fallback to avoid empty fields when requested
                     if extract and not (extracted or "").strip():
@@ -1168,21 +1121,15 @@ class Tools:
                         entry["extracted"] = extracted
 
                     results.append(entry)
-                    _progress(f"✅ Result {idx} complete: {title[:60]}")
 
                 except Exception as ex:
                     log_message(f"[search_internet] result error: {ex}", "WARNING")
-                    _progress(f"❌ Error processing result {idx}: {ex}")
                     continue
-
-            _progress(f"\n✨ Search complete! Processed {len(results)}/{len(anchors)} results successfully")
 
         except Exception as e:
             log_message(f"[search_internet] Fatal: {e}\n{traceback.format_exc()}", "ERROR")
-            _progress(f"❌ Fatal error: {e}")
         finally:
             if not retain_browser:
-                _progress(f"🔒 Closing browser...")
                 Tools.close_browser()
 
         if not results:
@@ -2033,114 +1980,3 @@ class Tools:
             return f"File not found: {path}"
         except Exception as e:
             return f"Error deleting file {path!r}: {e}"
-
-    @staticmethod
-    def list_workspace(path: str = ".",
-                       pattern: str = "**/*",
-                       include_files: bool = True,
-                       include_dirs: bool = False,
-                       max_results: int = 400) -> List[str]:
-        """
-        List workspace paths matching a glob pattern.
-        """
-        root = Tools._resolve_workspace_path(path)
-        results: List[str] = []
-        for entry in sorted(root.glob(pattern)):
-            if entry.is_file() and not include_files:
-                continue
-            if entry.is_dir() and not include_dirs:
-                continue
-            rel = entry.relative_to(WORKSPACE_ROOT)
-            results.append(str(rel))
-            if len(results) >= max_results:
-                break
-        return results
-
-    @staticmethod
-    def run_bash(command: str,
-                 cwd: str = ".",
-                 timeout: int = 20) -> Dict[str, Any]:
-        """
-        Execute a bash command inside the workspace and capture output.
-        """
-        working_dir = Tools._resolve_workspace_path(cwd)
-        try:
-            proc = subprocess.run(
-                ["/bin/bash", "-lc", command],
-                capture_output=True,
-                text=True,
-                cwd=str(working_dir),
-                timeout=timeout,
-            )
-            return {
-                "returncode": proc.returncode,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
-            }
-        except subprocess.TimeoutExpired as exc:
-            return {"returncode": None, "stdout": exc.stdout or "", "stderr": f"Timeout: {exc}"}
-        except Exception as exc:
-            return {"returncode": None, "stdout": "", "stderr": str(exc)}
-
-    @staticmethod
-    def search_text(pattern: str,
-                    path: str = ".",
-                    regex: bool = True,
-                    max_results: int = 200) -> List[Dict[str, Any]]:
-        """
-        Search for a pattern across text files in the workspace.
-        """
-        root = Tools._resolve_workspace_path(path)
-        matcher = re.compile(pattern) if regex else None
-        results: List[Dict[str, Any]] = []
-        for file_path in sorted(root.rglob("*")):
-            if not file_path.is_file():
-                continue
-            try:
-                text = file_path.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            for idx, line in enumerate(text.splitlines(), start=1):
-                found = matcher.search(line) if regex else (pattern in line)
-                if found:
-                    results.append({
-                        "file": str(file_path.relative_to(WORKSPACE_ROOT)),
-                        "line": idx,
-                        "text": line.strip(),
-                    })
-                    if len(results) >= max_results:
-                        return results
-        return results
-
-    @staticmethod
-    def replace_lines(filepath: str,
-                      start_line: int,
-                      end_line: int,
-                      new_content: str) -> str:
-        """
-        Replace a range of lines in a file with the provided text.
-        """
-        if start_line < 1 or end_line < start_line:
-            return "Invalid line range supplied."
-
-        path = Tools._resolve_workspace_path(filepath)
-        try:
-            existing = path.read_text(encoding="utf-8").splitlines(keepends=True)
-        except Exception as exc:
-            return f"Error reading {path}: {exc}"
-
-        start_idx = start_line - 1
-        end_idx = end_line
-        if start_idx > len(existing):
-            return "Start line exceeds file length."
-
-        replacement = new_content.splitlines(keepends=True)
-        existing[start_idx:end_idx] = replacement
-
-        try:
-            path.write_text("".join(existing), encoding="utf-8")
-        except Exception as exc:
-            return f"Error writing {path}: {exc}"
-
-        return (f"Replaced lines {start_line}-{end_line} in "
-                f"{path.relative_to(WORKSPACE_ROOT)} with {len(replacement)} new line(s).")

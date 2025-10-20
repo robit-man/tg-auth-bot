@@ -32,6 +32,12 @@ except ImportError:
     TOOLS_AVAILABLE = False
     Tools = None
 
+try:
+    from tool_schema import ToolSchemaGenerator, ToolFormatter
+    TOOL_SCHEMA_AVAILABLE = True
+except ImportError:
+    TOOL_SCHEMA_AVAILABLE = False
+
 _CATEGORY_ENV = os.getenv("TOOL_CONTEXT_CATEGORIES", "")
 _ALLOWED_TOOL_CATEGORIES: Optional[Set[str]] = {
     cat.strip().lower()
@@ -276,20 +282,10 @@ class ToolInspector:
             lines.append("-" * 80)
 
             for tool in sorted(by_category[category], key=lambda t: t.name):
-                lines.append(f"\n• {tool.name}{tool.signature}")
-
-                doc_lines: List[str] = []
-                for raw_line in (tool.docstring or "").splitlines():
-                    stripped = raw_line.strip()
-                    if stripped:
-                        doc_lines.append(stripped)
-                    if len(doc_lines) >= max_doc_lines:
-                        break
-                doc_preview = " ".join(doc_lines)
-                if doc_preview and len(doc_preview) > max_doc_chars:
-                    doc_preview = doc_preview[:max_doc_chars].rstrip() + "..."
-                if doc_preview:
-                    lines.append(f"  {doc_preview}")
+                entry = f"\n• {tool.name}{tool.signature}"
+                if tool.is_async:
+                    entry += " [async]"
+                lines.append(entry)
 
                 for param_line in ToolInspector._format_param_lines(tool):
                     lines.append(param_line)
@@ -510,7 +506,13 @@ class DAGExecutor:
 # Tool Context Builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_tool_context_for_prompt(user_id: int, admin_whitelist: set, include_examples: bool = True) -> str:
+def build_tool_context_for_prompt(
+    user_id: int,
+    admin_whitelist: set,
+    include_examples: bool = True,
+    compact: bool = False,
+    max_tools: Optional[int] = None
+) -> str:
     """Build tool context to include in AI prompt for admin users"""
 
     # Check if user is admin
@@ -520,6 +522,28 @@ def build_tool_context_for_prompt(user_id: int, admin_whitelist: set, include_ex
     if not TOOLS_AVAILABLE:
         return "\n[TOOLS: Not available - tools.py not found]\n"
 
+    # Use new schema-based formatting if available
+    if TOOL_SCHEMA_AVAILABLE:
+        try:
+            schemas = ToolSchemaGenerator.generate_all_schemas()
+
+            # Filter by allowed categories
+            if _ALLOWED_TOOL_CATEGORIES:
+                schemas = [s for s in schemas if s.category.lower() in _ALLOWED_TOOL_CATEGORIES]
+
+            if compact:
+                return "\n" + ToolFormatter.format_compact(schemas) + "\n"
+            else:
+                return "\n" + ToolFormatter.format_for_prompt(
+                    schemas,
+                    categories=list(_ALLOWED_TOOL_CATEGORIES) if _ALLOWED_TOOL_CATEGORIES else None,
+                    max_tools=max_tools
+                ) + "\n"
+        except Exception as e:
+            print(f"[tool_context] Schema generation failed: {e}")
+            # Fall back to old method
+
+    # Fallback to original formatting
     context_parts = [
         "\n" + "=" * 80,
         "TOOL CAPABILITIES AVAILABLE",

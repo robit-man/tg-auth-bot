@@ -270,6 +270,23 @@ class MemoryVisualizer:
         if self.sleep_state != 'awake':
             self.autonomous_indicator = max(self.autonomous_indicator, 20)
 
+    def _handle_emotion(self, data: dict):
+        """Handle emotion profile updates"""
+        if not isinstance(data, dict):
+            return
+        entry = {
+            'time': data.get('time', time.time()),
+            'emotion': data.get('emotion', '(unknown)'),
+            'intent': data.get('intent', ''),
+            'tone': data.get('tone', ''),
+            'confidence': float(data.get('confidence', 0.0) or 0.0),
+            'user_id': data.get('user_id'),
+            'chat_id': data.get('chat_id'),
+            'tool': data.get('tool'),
+            'message_excerpt': data.get('message_excerpt', ''),
+        }
+        self.emotion_log.append(entry)
+
     def _spawn_memory_cell(self, memory_data: dict):
         """Spawn a new cell in the memory grid based on recall"""
         scope = memory_data.get('scope', 'unknown')
@@ -558,6 +575,17 @@ class MemoryVisualizer:
             consolidation_count = self.autonomous_stats.get('consolidations', 0)
             assessment_count = self.autonomous_stats.get('assessments', 0)
 
+            emotion_text = ""
+            if self.emotion_log:
+                latest = self.emotion_log[-1]
+                emotion = latest.get('emotion', '(unknown)')
+                tone = latest.get('tone', '')
+                confidence = latest.get('confidence', 0.0)
+                if tone:
+                    emotion_text = f" | EMOTION: {emotion} ({tone}) {confidence:.2f}"
+                else:
+                    emotion_text = f" | EMOTION: {emotion} {confidence:.2f}"
+
             # Add sleep discoveries if in sleep state
             if self.sleep_state != 'awake' and self.sleep_discoveries:
                 patterns = self.sleep_discoveries.get('patterns', 0)
@@ -566,11 +594,11 @@ class MemoryVisualizer:
 
                 stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
                              f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count} "
-                             f"| SLEEP: P:{patterns} REL:{relationships} I:{insights}")
+                             f"| SLEEP: P:{patterns} REL:{relationships} I:{insights}{emotion_text}")
             else:
                 stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
                              f"| Total:{total_count} Active:{active_cells} "
-                             f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count}")
+                             f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count}{emotion_text}")
 
             if len(stats_text) < width - 4:
                 self.stdscr.addstr(stats_y, 2, stats_text, self.color_pairs.get('metadata', 0))
@@ -726,6 +754,19 @@ def update_sleep_state(state: str, time_in_state: float = 0, cycle_count: int = 
                 'cycle_count': cycle_count,
                 'discoveries': discoveries or {}
             }))
+        except queue.Full:
+            pass
+
+
+def log_emotion_state(**details):
+    """Log an emotion profile update"""
+    viz = get_visualizer()
+    if viz.running:
+        payload = dict(details)
+        if 'time' not in payload:
+            payload['time'] = time.time()
+        try:
+            viz.update_queue.put_nowait(('emotion', payload))
         except queue.Full:
             pass
 
