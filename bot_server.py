@@ -12,13 +12,13 @@ import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, 
 from collections import defaultdict
 from pathlib import Path
 from contextlib import closing
-from functools import wraps, lru_cache
-from typing import Optional, Tuple, List, Iterable, Dict, Callable, Any
+from functools import wraps
+from typing import Optional, Tuple, List, Iterable, Dict, Callable
 from datetime import datetime, timezone
 
 # Memory visualizer (optional - graceful degradation if import fails)
 try:
-    from memory_visualizer import start_visualizer, log_recall, log_operation, update_stats, log_autonomous, update_sleep_state, log_emotion_state
+    from memory_visualizer import start_visualizer, log_recall, log_operation, update_stats, log_autonomous, update_sleep_state
     VISUALIZER_AVAILABLE = True
 except ImportError:
     VISUALIZER_AVAILABLE = False
@@ -28,7 +28,6 @@ except ImportError:
     def update_stats(*args, **kwargs): pass
     def log_autonomous(*args, **kwargs): pass
     def update_sleep_state(*args, **kwargs): pass
-    def log_emotion_state(*args, **kwargs): pass
 
 # Sleep cycle (optional - graceful degradation if import fails)
 try:
@@ -76,12 +75,6 @@ def ensure_venv_and_deps():
     ]
     print("[bootstrap] Installing core requirements ...")
     subprocess.check_call([py, "-m", "pip", "install", *reqs])
-    print("[bootstrap] Installing toolchain extras ...")
-    for pkg in tool_reqs:
-        try:
-            subprocess.check_call([py, "-m", "pip", "install", pkg])
-        except subprocess.CalledProcessError as exc:
-            print(f"[bootstrap] Warning: failed to install optional package '{pkg}': {exc}")
     print("[bootstrap] Re-exec in .venv ...")
     os.execv(py, [py, *sys.argv])
 
@@ -309,84 +302,10 @@ def add_admin_ids(ids_to_add: Iterable[int]):
     ADMIN_WHITELIST |= {int(i) for i in ids_to_add}
     _write_env_var("ADMIN_WHITELIST", ",".join(str(i) for i in sorted(ADMIN_WHITELIST)))
 
-# ──────────────────────────────────────────────────────────────
-# Intelligent routing, RAG, and vision components
-# ──────────────────────────────────────────────────────────────
-TOOL_ROUTER: Optional[Any] = None
-RAG_STORE: Optional[Any] = None
-VISION_HANDLER: Optional[Any] = None
-
-def init_intelligent_components():
-    """Initialize intelligent routing, RAG, and vision components"""
-    global TOOL_ROUTER, RAG_STORE, VISION_HANDLER
-
-    if not INTELLIGENT_ROUTING_AVAILABLE:
-        print("[intelligent] Components not available (missing tool_router, document_rag, or vision_handler)")
-        return
-
-    # Initialize tool router
-    if OLLAMA_MODEL and IntelligentToolRouter:
-        try:
-            TOOL_ROUTER = IntelligentToolRouter(
-                ollama_model=OLLAMA_MODEL,
-                enable_llm_routing=True,
-            )
-            print(f"[intelligent] Tool router initialized with model: {OLLAMA_MODEL}")
-        except Exception as e:
-            print(f"[intelligent] Failed to initialize tool router: {e}")
-
-    # Initialize RAG store
-    if OLLAMA_EMBED_MODEL and DocumentRAGStore:
-        try:
-            rag_db_path = ROOT / "data" / "documents.db"
-            rag_data_dir = ROOT / "data"
-            RAG_STORE = DocumentRAGStore(
-                db_path=rag_db_path,
-                embed_model=OLLAMA_EMBED_MODEL,
-                vision_model=os.getenv("OLLAMA_VISION_MODEL", "gemma3:4b"),
-                data_dir=rag_data_dir,
-            )
-            print(f"[intelligent] RAG store initialized at {rag_db_path}")
-        except Exception as e:
-            print(f"[intelligent] Failed to initialize RAG store: {e}")
-
-    # Initialize vision handler
-    if VisionHandler:
-        try:
-            vision_model = os.getenv("OLLAMA_VISION_MODEL", "gemma3:4b")
-            VISION_HANDLER = VisionHandler(vision_model=vision_model)
-            print(f"[intelligent] Vision handler initialized with model: {vision_model}")
-        except Exception as e:
-            print(f"[intelligent] Failed to initialize vision handler: {e}")
-
-def admin_only(fn):
-    @wraps(fn)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat = update.effective_chat; user = update.effective_user
-        if not chat or chat.type not in ("group","supergroup"):
-            return await update.effective_message.reply_text("Run this in a group.")
-        member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status not in ("administrator","creator"):
-            return await update.effective_message.reply_text("Admins only.")
-        return await fn(update, context)
-    return wrapper
-
-def whitelist_only(fn):
-    @wraps(fn)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if user and user.id in ADMIN_WHITELIST:
-            return await fn(update, context)
-        return await update.effective_message.reply_text("Not allowed. This command is restricted.")
-    return wrapper
-
 MAX_CONTEXT_MESSAGES = int(os.getenv("MAX_CONTEXT_MESSAGES") or 300)
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS") or 12000)
 MAX_CONTEXT_USERS = int(os.getenv("MAX_CONTEXT_USERS") or 60)
 MAX_CONTEXT_GROUPS = int(os.getenv("MAX_CONTEXT_GROUPS") or 30)
-
-DEBUG_FLAGS: Dict[int, bool] = defaultdict(bool)
-DEBUG_CONTEXTS: Dict[tuple[int, int], Dict[str, str]] = {}
 
 # ──────────────────────────────────────────────────────────────
 # 2) Paths + shard dirs
@@ -760,64 +679,6 @@ async def with_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, coro):
     finally:
         stop.set()
 
-
-def _tool_bridge_ready() -> bool:
-    return bool(
-        TOOL_INTEGRATION_AVAILABLE
-        and BRIDGE_TOOLS_AVAILABLE
-        and EnhancedPromptBuilder is not None
-        and ToolExecutionCoordinator is not None
-    )
-
-
-async def generate_agentic_reply(
-    payload: dict,
-    user_id: Optional[int],
-    *,
-    include_examples: bool = True,
-    auto_execute: bool = True,
-    max_tools: int = 5,
-) -> Tuple[Optional[str], List[Any]]:
-    """
-    Run the main LLM call, injecting tool context and executing requested tools for admins.
-    Returns the (possibly augmented) reply text and execution metadata.
-    """
-    enhanced_payload = payload
-    executions: List[Any] = []
-    tool_access = _tool_bridge_ready()
-
-    if tool_access:
-        try:
-            enhanced_payload = EnhancedPromptBuilder.inject_tool_context(
-                payload,
-                user_id,  # type: ignore[arg-type]
-                ADMIN_WHITELIST,
-                include_examples=include_examples,
-            )
-        except Exception as exc:
-            print(f"[tools] Failed to inject tool context: {exc}")
-            enhanced_payload = payload
-
-    response = await ai_generate_async(enhanced_payload)
-    if not response or not tool_access:
-        return response, executions
-
-    try:
-        coordinator = ToolExecutionCoordinator(user_id, ADMIN_WHITELIST)  # type: ignore[call-arg]
-        modified_response, execution_results = await coordinator.process_ai_response(
-            response,
-            auto_execute=auto_execute,
-            max_tools=max_tools,
-            max_dag_nodes=max(4, max_tools * 2),
-            max_dags=2,
-        )
-        response = modified_response
-        executions = execution_results
-    except Exception as exc:
-        print(f"[tools] Failed to process tool executions: {exc}")
-
-    return response, executions
-
 # ──────────────────────────────────────────────────────────────
 # 7) KG (queued writes)
 # ──────────────────────────────────────────────────────────────
@@ -1006,130 +867,6 @@ async def similar_context(query: str, chat_id: int, thread_id: int, top_k: int =
         if len(chan)>=top_k and len(serv)>=top_k and len(glob)>=top_k: break
     return {"channel":"\n".join(chan[:top_k]), "server":"\n".join(serv[:top_k]), "global":"\n".join(glob[:top_k])}
 
-
-def _truncate_text(text: str, limit: int = 1800) -> str:
-    if not text:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
-
-
-def _json_dump(obj: Any, limit: int = 1800) -> str:
-    try:
-        rendered = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
-    except TypeError:
-        rendered = str(obj)
-    return _truncate_text(rendered, limit)
-
-
-def describe_available_tools(max_tools: int = 12) -> str:
-    if not TOOL_SUMMARY_AVAILABLE or not ToolInspector:
-        return "(tool catalog unavailable)"
-    summaries: List[str] = []
-    try:
-        for meta in ToolInspector.get_all_tools():
-            entry = f"{meta.name}{meta.signature}"
-            if meta.is_async:
-                entry += " [async]"
-            summaries.append(entry)
-    except Exception:
-        return "(tool catalog unavailable)"
-    if not summaries:
-        return "(no tools discovered)"
-    return "\n".join(summaries[:max_tools])
-
-def list_tool_signatures(max_tools: int = 20) -> str:
-    if not TOOL_SUMMARY_AVAILABLE or not ToolInspector:
-        return "(tool catalog unavailable)"
-    try:
-        tools = ToolInspector.get_all_tools()
-    except Exception:
-        return "(tool catalog unavailable)"
-    if not tools:
-        return "(no tools registered)"
-    tools.sort(key=lambda t: t.name.lower())
-    lines: List[str] = []
-    for tool in tools[:max_tools]:
-        signature = tool.signature or "()"
-        lines.append(f"- {tool.name}{signature}" + (" [async]" if tool.is_async else ""))
-        params = tool.parameters or []
-        required = [p["name"] for p in params if p.get("required")]
-        optional = [p["name"] for p in params if not p.get("required")]
-        if required:
-            lines.append(f"    required: {', '.join(required)}")
-        if optional:
-            lines.append(f"    optional: {', '.join(optional)}")
-    if len(tools) > max_tools:
-        lines.append(f"... ({len(tools) - max_tools} more)")
-    return "\n".join(lines)
-
-
-def build_debug_context_text(
-    user_text: str,
-    payload: Optional[dict],
-    context_bundle: Dict[str, str],
-    complexity_meta: Dict[str, object],
-    internal_state: Dict[str, object],
-    executed_actions: List[Any],
-    tool_runs: List[Any],
-    decision_meta: Dict[str, object],
-) -> str:
-    lines: List[str] = []
-    lines.append("INPUT MESSAGE:")
-    lines.append(_truncate_text(user_text or "(empty)", 600))
-
-    preface = ""
-    if payload and isinstance(payload.get("messages"), list) and len(payload["messages"]) >= 2:
-        preface = payload["messages"][1].get("content", "")
-    if preface:
-        lines.append("\nMODEL CONTEXT PREFACE:")
-        lines.append(_truncate_text(preface, 2000))
-
-    lines.append("\nCOMPLEXITY META:")
-    lines.append(_json_dump(complexity_meta, 900))
-
-    if decision_meta:
-        lines.append("\nDECISION META:")
-        lines.append(_json_dump(decision_meta, 600))
-
-    if context_bundle:
-        lines.append("\nCONTEXT BUNDLE:")
-        lines.append(_json_dump(context_bundle, 900))
-
-    snippet_count = len(internal_state.get("snippets") or []) if isinstance(internal_state, dict) else 0
-    lines.append(f"\nMEMORY STATE: snippets={snippet_count}, narrative={bool(internal_state.get('narrative')) if isinstance(internal_state, dict) else False}")
-
-    lines.append("\nAVAILABLE TOOL SUMMARIES:")
-    lines.append(describe_available_tools(15))
-
-    if executed_actions:
-        lines.append("\nEXECUTED INTERNAL ACTIONS:")
-        for name, result in executed_actions[:6]:
-            lines.append(f"- {name}: {_truncate_text(str(result), 160)}")
-    else:
-        lines.append("\nEXECUTED INTERNAL ACTIONS: (none)")
-
-    if tool_runs:
-        lines.append("\nTOOL EXECUTIONS:")
-        for run in tool_runs[:8]:
-            state = getattr(run, "state", None)
-            state_val = getattr(state, "value", state) if state is not None else "unknown"
-            result_preview = getattr(run, "result", None)
-            lines.append(f"- {getattr(run, 'tool_name', '(unknown)')} [{state_val}]: {_truncate_text(str(result_preview), 200)}")
-    else:
-        lines.append("\nTOOL EXECUTIONS: (none)")
-
-    return _truncate_text("\n".join(lines), 3500)
-
-
-def compose_debug_display(response_text: str, context_text: str, show: bool) -> str:
-    base = _truncate_text(response_text or "", 3500)
-    if not show:
-        return base
-    combined = f"{base}\n\n--- DEBUG CONTEXT ---\n{context_text}"
-    return _truncate_text(combined, 3900)
-
 # ──────────────────────────────────────────────────────────────
 # 9) Sharded writes (queued)
 # ──────────────────────────────────────────────────────────────
@@ -1272,7 +1009,6 @@ def command_catalog() -> Dict[str, List[tuple]]:
         ("/inspect <link|@user|id>", "Inspector."),
         ("/graph [here|server] [N]", "Show KG relations."),
         ("/autosystem [why]", "Regenerate the system prompt."),
-        ("/tools", "List available tool functions exposed to the AI."),
     ]
     return {"public": public, "admin": admin}
 
@@ -1285,71 +1021,34 @@ def format_commands_for_user(is_admin: bool) -> str:
         for cmd, help_ in cat["admin"]: lines.append(f"  {cmd} — {help_}")
     return "\n".join(lines)
 
-@whitelist_only
-async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if not chat:
-        return
-    chat_id = chat.id
-    args = [a.lower() for a in (context.args or [])]
-    if not args:
-        state = DEBUG_FLAGS.get(chat_id, False)
-        return await update.effective_message.reply_text(
-            f"Debug mode is {'ON' if state else 'OFF'} for this chat. Use /debug on or /debug off."
-        )
-    val = args[0]
-    if val in ("on", "true", "1", "enable", "enabled"):
-        DEBUG_FLAGS[chat_id] = True
-        await update.effective_message.reply_text(
-            "🔍 Debug mode enabled for this chat. Future responses will include a show/hide context toggle."
-        )
-    elif val in ("off", "false", "0", "disable", "disabled"):
-        DEBUG_FLAGS[chat_id] = False
-        await update.effective_message.reply_text("🔇 Debug mode disabled for this chat.")
-    else:
-        await update.effective_message.reply_text("Usage: /debug on|off")
-
 async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     is_admin = uid in ADMIN_WHITELIST if uid else False
     await update.effective_message.reply_text(format_commands_for_user(is_admin))
 
-
-async def debug_toggle_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query or not query.message:
-        return
-    data = (query.data or "").split(":")
-    if len(data) != 2:
-        await query.answer()
-        return
-    _, action = data
-    chat = query.message.chat
-    if not chat:
-        await query.answer()
-        return
-    key = (chat.id, query.message.message_id)
-    entry = DEBUG_CONTEXTS.get(key)
-    if not entry:
-        await query.answer("No debug context available.", show_alert=True)
-        return
-    show = action == "show"
-    new_text = compose_debug_display(entry.get("response", ""), entry.get("context", ""), show)
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Hide context", callback_data="debug:hide")]]
-        if show
-        else [[InlineKeyboardButton("Show context", callback_data="debug:show")]]
-    )
-    try:
-        await query.edit_message_text(new_text, reply_markup=markup)
-    except Exception:
-        await query.answer("Unable to update message.", show_alert=True)
-        return
-    await query.answer()
-
 # ──────────────────────────────────────────────────────────────
 # 12) Admin gating, inspector, setadmin flow
 # ──────────────────────────────────────────────────────────────
+def admin_only(fn):
+    @wraps(fn)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat = update.effective_chat; user = update.effective_user
+        if not chat or chat.type not in ("group","supergroup"):
+            return await update.effective_message.reply_text("Run this in a group.")
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status not in ("administrator","creator"):
+            return await update.effective_message.reply_text("Admins only.")
+        return await fn(update, context)
+    return wrapper
+
+def whitelist_only(fn):
+    @wraps(fn)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user and user.id in ADMIN_WHITELIST:
+            return await fn(update, context)
+        return await update.effective_message.reply_text("Not allowed. This command is restricted.")
+    return wrapper
 
 async def make_group_readonly(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     perms = ChatPermissions(
@@ -1376,13 +1075,35 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = textwrap.dedent(f"""
         ✅ Gating enabled for *{chat.title}*.
 
-        1) Group default is now read-only.
-        2) Pin this “Start” link so newcomers can unlock:
-           {start_link}
+def extract_triples_with_llm(snippet: str) -> List[dict]:
+    prompt = textwrap.dedent(f"""
+        Extract 1-6 triples SUBJECT|RELATION|OBJECT as JSON lines {{"s":"","r":"","o":""}}.
+        Keep concrete and non-speculative.
 
-        Primary server chat id: `{PRIMARY_CHAT_ID}`
+        Snippet:
+        {snippet}
     """).strip()
-    await update.effective_message.reply_text(msg, disable_web_page_preview=True, parse_mode="Markdown")
+    try:
+        r = requests.post(OLLAMA_URL + "/api/chat",
+                          json={"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False},
+                          timeout=40)
+        r.raise_for_status()
+        data = r.json() or {}
+        content = (data.get("message") or {}).get("content") or ""
+    except Exception:
+        return []
+    triples = []
+    for line in content.splitlines():
+        line=line.strip().strip(",; ")
+        if not (line.startswith("{") and line.endswith("}")): continue
+        try:
+            obj=json.loads(line)
+            s=(obj.get("s") or obj.get("subject") or "").strip()
+            r_=(obj.get("r") or obj.get("relation") or "").strip()
+            o=(obj.get("o") or obj.get("object") or "").strip()
+            if s and r_ and o: triples.append({"s":s[:120],"r":r_[:60],"o":o[:120]})
+        except Exception: pass
+    return triples[:6]
 
 @admin_only
 async def ungate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1523,82 +1244,6 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception: lines.append(f"<b>Primary</b>: (invalid) {PRIMARY_CHAT_ID}")
     if here and here.type in ("group","supergroup"): lines.append(f"<b>Here</b>: {here.title} (id={here.id})")
     await update.effective_message.reply_html("\n".join(lines), disable_web_page_preview=True)
-
-@admin_only
-async def tools_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /tools - Show available tools for admin users
-    Usage:
-      /tools           - Show all tools with full details
-      /tools compact   - Show compact tool list
-      /tools [category] - Show tools in specific category (e.g., web, browser, filesystem)
-    """
-    if not TOOL_SUMMARY_AVAILABLE or not ToolInspector:
-        msg = (
-            "⚠️ Tool catalog unavailable.\n\n"
-            "Tool integration modules are not loaded. This usually means:\n"
-            "• tools.py is missing required dependencies (bs4, selenium, etc.)\n"
-            "• tool_integration.py or tool_schema.py are not in the correct location\n\n"
-            "To enable tools, ensure all dependencies are installed:\n"
-            "pip install beautifulsoup4 selenium duckduckgo_search"
-        )
-        await update.effective_message.reply_text(msg)
-        return
-
-    user_id = update.effective_user.id if update.effective_user else 0
-    args = context.args or []
-
-    # Determine mode
-    compact = "compact" in args
-    category = None
-    for arg in args:
-        if arg.lower() in ["web", "browser", "filesystem", "system", "ai", "general"]:
-            category = arg.lower()
-            break
-
-    # Use new schema-based formatting if available
-    if TOOL_SCHEMA_AVAILABLE and ToolSchemaGenerator and ToolFormatter:
-        try:
-            schemas = ToolSchemaGenerator.generate_all_schemas()
-
-            if not schemas:
-                await update.effective_message.reply_text("No tools registered in tools.py.")
-                return
-
-            # Filter by category if specified
-            categories = [category] if category else None
-
-            if compact:
-                catalog = ToolFormatter.format_compact(schemas, max_per_category=10)
-            else:
-                catalog = ToolFormatter.format_for_prompt(
-                    schemas,
-                    categories=categories,
-                    max_tools=50 if not category else None
-                )
-
-            # Send in chunks if too long
-            if len(catalog) > 4000:
-                chunks = [catalog[i:i+3900] for i in range(0, len(catalog), 3900)]
-                for i, chunk in enumerate(chunks[:3]):  # Max 3 messages
-                    header = f"📚 Tools ({i+1}/{min(len(chunks), 3)})\n\n" if len(chunks) > 1 else ""
-                    await update.effective_message.reply_text(f"{header}{chunk}")
-            else:
-                await update.effective_message.reply_text(catalog)
-            return
-
-        except Exception as e:
-            # Fall back to simple listing
-            pass
-
-    # Fallback to simple tool signatures
-    catalog = list_tool_signatures(max_tools=40)
-    if not catalog or catalog.startswith("(no tools"):
-        await update.effective_message.reply_text("No tools registered in tools.py.")
-        return
-    if len(catalog) > 3500:
-        catalog = catalog[:3497] + "..."
-    await update.effective_message.reply_text(f"Available tools:\n{catalog}")
 
 # /setadmin bootstrap & approvals (unchanged)
 async def setadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2176,34 +1821,6 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
     bundle = context_bundle or {}
     complexity = complexity_meta or {}
 
-    if is_admin:
-        # Use full schema-based tool exposure for admin users
-        if TOOL_SCHEMA_AVAILABLE and ToolSchemaGenerator and ToolFormatter:
-            try:
-                schemas = ToolSchemaGenerator.generate_all_schemas()
-                if schemas:
-                    # Use compact format to save context space, but include all essential info
-                    tool_catalog = ToolFormatter.format_for_prompt(
-                        schemas,
-                        categories=None,  # Show all categories
-                        max_tools=30,  # Limit to prevent context overflow
-                        include_examples=True,
-                    )
-                else:
-                    # Fallback to simple signatures
-                    tool_catalog = list_tool_signatures(18)
-            except Exception as e:
-                print(f"[tools] Schema-based formatting failed: {e}")
-                tool_catalog = list_tool_signatures(18)
-        else:
-            # Fallback to simple tool listing
-            tool_catalog = list_tool_signatures(18)
-
-        if not tool_catalog or tool_catalog.startswith("(tool catalog") or tool_catalog.startswith("(no tools"):
-            tool_catalog = "(tool catalog unavailable)"
-    else:
-        tool_catalog = "(restricted — admin only)"
-
     preface = textwrap.dedent(f"""
         NOW_UTC: {now_utc}
         NOW_LOCAL: {now_local}
@@ -2223,58 +1840,6 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
           handle: {uhandle}
           display_name: {uname}
           is_admin: {is_admin}
-
-        TOOL FUNCTIONS (admin visibility):
-        {tool_catalog}
-
-        TOOL USAGE INSTRUCTIONS:
-
-        1. WHEN TO USE TOOLS:
-           - User explicitly asks you to search, fetch, or gather information
-           - You need current/external information not in context
-           - User asks about documents they've uploaded (use knowledge query)
-           - You need to perform file operations, system commands, etc.
-
-        2. HOW TO CALL TOOLS:
-           Simple tool call:
-             Tools.tool_name(arg1, arg2, kwarg1=value)
-
-           Async tool call (for async tools marked [async]):
-             await Tools.tool_name(arg1, arg2)
-
-           Example: Tools.search_internet('Python 3.12 features', num_results=5)
-
-        3. MULTI-TOOL WORKFLOWS (DAG):
-           For complex tasks needing multiple tools in sequence:
-
-           <<TOOL_DAG>>
-           summary: Search and analyze Python features
-           nodes:
-             - id: search1
-               tool: search_internet
-               args:
-                 topic: "Python 3.12 new features"
-                 num_results: 3
-
-             - id: fetch1
-               tool: fetch_webpage
-               args:
-                 url: "{{search1.results[0].url}}"
-               depends_on: [search1]
-           <<END_DAG>>
-
-        4. BEST PRACTICES:
-           - Check tool parameter requirements from the tool catalog above
-           - Use quoted strings for text parameters: 'like this'
-           - For numbers use: num_results=5 (no quotes)
-           - Summarize tool outputs naturally, don't paste raw output
-           - Chain tools with DAGs when one output feeds another
-           - Skip tools if answer is already clear from context
-
-        5. AFTER TOOL EXECUTION:
-           - Tool results will be injected into context automatically
-           - Synthesize a natural language response incorporating the results
-           - Cite sources when appropriate (URLs, page numbers, etc.)
 
         GRAPH_CONTEXT (server={chat_id}, channel={thread_id or 0}):
           Top entities:
@@ -2913,7 +2478,6 @@ def fetch_latest_summary(scope: str, chat_id: int, thread_id: int, user_id: int 
     return row[0] if row else ""
 
 async def hierarchical_memory_rollup():
-    rollup_created = False
     try:
         log_autonomous('consolidation', scope='all', details='Scanning for rollup candidates')
 
@@ -2998,8 +2562,6 @@ async def hierarchical_memory_rollup():
                 with closing(db()) as con:
                     _store_summary(con)
 
-            rollup_created = True
-
             log_autonomous('consolidation', scope=scope, count=len(top_entries),
                           details=f'Rolled up {base_category}')
 
@@ -3011,8 +2573,6 @@ async def hierarchical_memory_rollup():
                               details=f'Pruned old {base_category} summaries')
     except Exception:
         pass
-    if rollup_created:
-        await maybe_update_system_prompt_from_reflection(force=True)
 
 async def hierarchical_rollup_job(context: ContextTypes.DEFAULT_TYPE):
     log_autonomous('rollup', scope='hierarchical', details='Starting hierarchical memory rollup')
@@ -3109,7 +2669,6 @@ async def assess_discussion_complexity(message_text: str,
         "user_signals": context_bundle.get("user_signals", "(none)") != "(none)",
         "global_themes": context_bundle.get("global_themes", "(none)") != "(none)",
     }
-    tool_summary_text = describe_available_tools(15)
     prompt = textwrap.dedent(f"""
         You are an orchestration planner for Gatekeeper Bot.
         Decide if the latest interaction requires additional internal tools.
@@ -3121,8 +2680,6 @@ async def assess_discussion_complexity(message_text: str,
         Memory snippets: {snippet_preview or '(none)'}
         Context bundle: {context_bundle}
         Features: {features}
-        Tool summaries:
-        {tool_summary_text}
 
         Choose at most 2 actions. Prefer none when conversation is simple.
     """).strip()
@@ -3285,15 +2842,6 @@ async def analyze_user_affect_intent(meta: dict, chat, thread_id: int, user, mes
                                     "emotion_profile", content[:240], metadata, confidence, sources)
     mood_state = await apply_feedback_to_mood(emotion, tone, intent, confidence,
                                               getattr(chat, "id", 0), int(user_id), metadata)
-    log_emotion_state(
-        emotion=emotion,
-        intent=intent,
-        tone=tone,
-        confidence=confidence,
-        user_id=int(user_id),
-        chat_id=getattr(chat, "id", 0),
-        message_excerpt=message_text[:160],
-    )
     return mood_state
 
 async def maybe_update_system_prompt_from_reflection(force: bool = False):
@@ -3305,20 +2853,15 @@ async def maybe_update_system_prompt_from_reflection(force: bool = False):
     if not force and now - last_ts < 3600:
         return
     with closing(db()) as con:
-        reflection_rows = con.execute(
+        rows = con.execute(
             """SELECT content, metadata FROM memory_entries
                WHERE scope='global' AND category='self_reflection'
                ORDER BY created_ts DESC LIMIT 12"""
         ).fetchall()
-        summary_rows = con.execute(
-            """SELECT summary, metadata, category, created_ts FROM memory_summaries
-               WHERE scope='global' AND category LIKE '%_rollup'
-               ORDER BY created_ts DESC LIMIT 5"""
-        ).fetchall()
-    if not reflection_rows and not summary_rows:
+    if not rows:
         return
     reflections = []
-    for content, metadata_json in reflection_rows:
+    for content, metadata_json in rows:
         meta = {}
         try:
             meta = json.loads(metadata_json or "{}")
@@ -3327,28 +2870,13 @@ async def maybe_update_system_prompt_from_reflection(force: bool = False):
         ts = meta.get("generated")
         stamp = datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else ""
         reflections.append(f"[{stamp}] {content}")
-    summaries = []
-    for summary, metadata_json, category, created_ts in summary_rows:
-        meta = {}
-        try:
-            meta = json.loads(metadata_json or "{}")
-        except Exception:
-            pass
-        ts = meta.get("generated") or created_ts
-        stamp = datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else ""
-        snippet = textwrap.shorten((summary or "").strip(), width=320, placeholder="…")
-        label = category or "rollup"
-        summaries.append(f"[{stamp}] ({label}) {snippet}")
     prompt = textwrap.dedent(f"""
-        Use the latest global summaries and self-reflections to refine Gatekeeper Bot's internal system prompt.
-        Keep it under 600 words, emphasise tone, decision rules, memory usage, and safety guardrails.
+        Based on the recent self-reflections, adjust Gatekeeper Bot's internal system prompt.
+        Keep it under 600 words, emphasise tone, decision rules, safety, and memory usage guidance.
         Return plain text (no JSON).
 
-        GLOBAL SUMMARIES:
-        {('\\n'.join(summaries)) if summaries else '(none)'}
-
-        SELF-REFLECTIONS:
-        {('\\n'.join(reflections)) if reflections else '(none)'}
+        REFLECTIONS:
+        {'\\n'.join(reflections)}
     """).strip()
     new_prompt = await ai_generate_async({"model": OLLAMA_MODEL, "messages":[{"role":"user","content":prompt}], "stream": False})
     new_prompt = _sanitize_internal_blob(new_prompt or "")
@@ -3862,171 +3390,6 @@ def start_auto_reloader():
     AUTO_RELOAD_THREAD.start()
 
 # ──────────────────────────────────────────────────────────────
-# 15.5) Document and Image Handlers (RAG + Vision)
-# ──────────────────────────────────────────────────────────────
-
-async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle document uploads for RAG ingestion"""
-    if not RAG_STORE:
-        return
-
-    m = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not m or not m.document or not user:
-        return
-
-    # Download the file
-    try:
-        file = await context.bot.get_file(m.document.file_id)
-        file_path = ROOT / "data" / "uploads" / f"{user.id}_{m.document.file_name}"
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        await file.download_to_drive(str(file_path))
-
-        # Notify user
-        await m.reply_text(f"📄 Processing document: {m.document.file_name}...")
-
-        # Ingest into RAG
-        use_vision = chat.type == "private" or (user.id in ADMIN_WHITELIST)  # Vision only for DMs or admins
-        doc_id = RAG_STORE.add_document_from_telegram(
-            file_path=file_path,
-            user_id=user.id,
-            chat_id=chat.id,
-            message_id=m.message_id,
-            use_vision=use_vision,
-        )
-
-        if doc_id:
-            await m.reply_text(
-                f"✅ Document ingested successfully!\n"
-                f"Document ID: {doc_id[:8]}\n"
-                f"You can now ask questions about this document."
-            )
-        else:
-            await m.reply_text("❌ Failed to process document. Please check the file format.")
-
-    except Exception as e:
-        print(f"[rag] Document upload failed: {e}")
-        await m.reply_text(f"❌ Error processing document: {str(e)}")
-
-
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo uploads for vision analysis"""
-    if not VISION_HANDLER:
-        return
-
-    m = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not m or not m.photo or not user:
-        return
-
-    # Get the largest photo
-    photo = m.photo[-1]
-
-    # Download the photo
-    try:
-        file = await context.bot.get_file(photo.file_id)
-        file_path = ROOT / "data" / "images" / f"{user.id}_{photo.file_id}.jpg"
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        await file.download_to_drive(str(file_path))
-
-        # Analyze with vision model
-        caption = m.caption or "Describe this image in detail"
-
-        await m.reply_text("🔍 Analyzing image...")
-
-        result = VISION_HANDLER.analyze_image(
-            image_path=file_path,
-            user_prompt=caption,
-        )
-
-        if result.success:
-            response = f"🖼️ Image Analysis:\n\n{result.description}"
-
-            # If there's ongoing conversation context, offer to continue
-            if chat.type == "private":
-                response += "\n\n💬 Feel free to ask questions about this image!"
-
-            await m.reply_text(response)
-        else:
-            await m.reply_text(f"❌ Vision analysis failed: {result.error}")
-
-    except Exception as e:
-        print(f"[vision] Photo analysis failed: {e}")
-        await m.reply_text(f"❌ Error analyzing image: {str(e)}")
-
-
-# ──────────────────────────────────────────────────────────────
-# 15.9) Intelligent routing helper
-# ──────────────────────────────────────────────────────────────
-
-async def handle_real_tool_execution(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str,
-    user: Any,
-    chat: Any,
-) -> Optional[bool]:
-    """
-    Use REAL tool execution with LLM decision making and Telegram UI.
-
-    Returns True if tool was executed, False/None otherwise.
-    """
-    if not REAL_TOOL_EXECUTION_AVAILABLE or not user:
-        return None
-
-    # Only for admin users
-    if user.id not in ADMIN_WHITELIST:
-        return None
-
-    try:
-        # Step 1: Use LLM to decide if tool is needed
-        decision = await ToolDecisionMaker.decide_tool_from_message(
-            text,
-            ollama_model=OLLAMA_MODEL,
-            ollama_url=OLLAMA_URL,
-        )
-
-        # If no tool needed, return None to proceed with normal flow
-        if decision.decision_type == ToolDecisionType.DIRECT_REPLY:
-            return None
-
-        # Step 2: Send confirmation message with buttons
-        if decision.needs_confirmation:
-            confirmation_msg = await ToolTelegramUI.send_tool_confirmation(
-                update,
-                context,
-                decision,
-            )
-
-            # For now, auto-execute (later we'll wait for button press)
-            # TODO: Store decision in context.user_data and wait for callback
-            await asyncio.sleep(1)  # Brief pause to show confirmation
-
-        # Step 3: Execute tool with progress UI
-        result = await ToolTelegramUI.execute_tool_with_progress_ui(
-            update,
-            context,
-            decision,
-            progress_message=confirmation_msg if decision.needs_confirmation else None,
-        )
-
-        # Tool was executed (result will be shown by UI)
-        return True
-
-    except Exception as e:
-        print(f"[real_tool] Execution failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-# ──────────────────────────────────────────────────────────────
 # 16) Text handler
 # ──────────────────────────────────────────────────────────────
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4053,12 +3416,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (m.text or "").strip()
         if not text: return
         thread_id = 0
-
-        # Try real tool execution first (for admin users)
-        if REAL_TOOL_EXECUTION_AVAILABLE and user and user.id in ADMIN_WHITELIST:
-            tool_executed = await handle_real_tool_execution(update, context, text, user, chat)
-            if tool_executed:
-                return  # Tool was executed, UI handled response
         reply_to = getattr(m, "reply_to_message", None)
         if reply_to and getattr(reply_to, "from_user", None) and user and meta:
             src_id = getattr(user, "id", None)
@@ -4112,64 +3469,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       internal_state=internal_state,
                                       context_bundle=context_bundle,
                                       complexity_meta=complexity_meta)
-            # Use more tools for admin users who have full tool access
-            user_id = getattr(user, "id", None)
-            is_admin_user = user_id in ADMIN_WHITELIST if user_id else False
-            max_tools_allowed = 8 if is_admin_user else 3
-
-            resp, tool_runs = await with_typing(
-                context,
-                chat.id,
-                generate_agentic_reply(
-                    payload,
-                    user_id,
-                    include_examples=True,
-                    auto_execute=True,  # Execute tools automatically
-                    max_tools=max_tools_allowed,
-                ),
-            )
+            resp = await with_typing(context, chat.id, ai_generate_async(payload))
             if resp:
-                if tool_runs:
-                    tool_summary = []
-                    for run in tool_runs:
-                        state_obj = getattr(run, "state", None)
-                        state_val = getattr(state_obj, "value", state_obj)
-                        result_preview = getattr(run, "result", None)
-                        if result_preview is None:
-                            preview_txt = "(None)"
-                        else:
-                            preview_txt = str(result_preview)
-                        tool_summary.append(
-                            {
-                                "tool": getattr(run, "tool_name", ""),
-                                "state": state_val,
-                                "result_preview": preview_txt[:200],
-                            }
-                        )
-                    complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
-                debug_enabled = DEBUG_FLAGS.get(chat.id, False)
-                debug_context_text = ""
-                reply_markup = None
-                if debug_enabled:
-                    debug_context_text = build_debug_context_text(
-                        text,
-                        payload,
-                        context_bundle,
-                        complexity_meta,
-                        internal_state,
-                        executed_actions,
-                        tool_runs,
-                        decision_meta,
-                    )
-                    reply_markup = InlineKeyboardMarkup(
-                        [[InlineKeyboardButton("Show context", callback_data="debug:show")]]
-                    )
-                reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
-                if debug_enabled and reply_msg:
-                    DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
-                        "response": resp,
-                        "context": debug_context_text,
-                    }
+                await m.reply_text(resp)
                 asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
                                                                 thread_ctx, text, resp))
                 mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
@@ -4245,68 +3547,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   internal_state=internal_state,
                                   context_bundle=context_bundle,
                                   complexity_meta=complexity_meta)
-        # Use more tools for admin users who have full tool access
-        user_id = getattr(user, "id", None)
-        is_admin_user = user_id in ADMIN_WHITELIST if user_id else False
-        max_tools_allowed = 8 if is_admin_user else 3
-
-        resp, tool_runs = await with_typing(
-            context,
-            chat.id,
-            generate_agentic_reply(
-                payload,
-                user_id,
-                include_examples=True,
-                auto_execute=True,
-                max_tools=max_tools_allowed,
-            ),
-        )
+        resp = await with_typing(context, chat.id, ai_generate_async(payload))
         if resp:
-            if tool_runs:
-                tool_summary = []
-                for run in tool_runs:
-                    state_obj = getattr(run, "state", None)
-                    state_val = getattr(state_obj, "value", state_obj)
-                    result_preview = getattr(run, "result", None)
-                    if result_preview is None:
-                        preview_txt = "(None)"
-                    else:
-                        preview_txt = str(result_preview)
-                    tool_summary.append(
-                        {
-                            "tool": getattr(run, "tool_name", ""),
-                            "state": state_val,
-                            "result_preview": preview_txt[:200],
-                        }
-                    )
-                complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
-            debug_enabled = DEBUG_FLAGS.get(chat.id, False)
-            debug_context_text = ""
-            reply_markup = None
-            if debug_enabled:
-                debug_context_text = build_debug_context_text(
-                    text,
-                    payload,
-                    context_bundle,
-                    complexity_meta,
-                    internal_state,
-                    executed_actions,
-                    tool_runs,
-                    decision_meta,
-                )
-                reply_markup = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("Show context", callback_data="debug:show")]]
-                )
-            reply_msg = None
             try:
-                reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
+                await m.reply_text(resp)
             except Exception:
-                reply_msg = await context.bot.send_message(chat_id=chat.id, text=resp, reply_markup=reply_markup)
-            if debug_enabled and reply_msg:
-                DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
-                    "response": resp,
-                    "context": debug_context_text,
-                }
+                await context.bot.send_message(chat_id=chat.id, text=resp)
             asyncio.create_task(process_memory_update_async(meta, chat, thread_id, user,
                                                             thread_ctx, text, resp))
             mood_state = await analyze_user_affect_intent(meta, chat, thread_id, user, text)
@@ -4489,9 +3735,6 @@ def main():
     elif SLEEP_CYCLE_ENABLED and not SLEEP_CYCLE_AVAILABLE:
         print("[sleep] Sleep cycle enabled but module not available.")
 
-    # Initialize intelligent routing, RAG, and vision
-    init_intelligent_components()
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Gating
@@ -4510,8 +3753,6 @@ def main():
     app.add_handler(CommandHandler("system", system_cmd))
     app.add_handler(CommandHandler("inspect", inspect_cmd))
     app.add_handler(CommandHandler("autosystem", autosystem_cmd))
-    app.add_handler(CommandHandler("debug", debug_cmd))
-    app.add_handler(CommandHandler("tools", tools_cmd))
 
     # Profiles (DM)
     app.add_handler(CommandHandler("profile", profile_cmd))
@@ -4519,21 +3760,11 @@ def main():
     # /setadmin + approvals
     app.add_handler(CommandHandler("setadmin", setadmin_cmd))
     app.add_handler(CallbackQueryHandler(adminreq_cb, pattern=r"^adminreq:(approve|deny):\d+$"))
-    app.add_handler(CallbackQueryHandler(debug_toggle_cb, pattern=r"^debug:(show|hide)$"))
-
-    # Tool execution callbacks (confirmation and rating)
-    if REAL_TOOL_EXECUTION_AVAILABLE:
-        app.add_handler(CallbackQueryHandler(handle_tool_confirmation_callback, pattern=r"^tool_confirm:"))
-        app.add_handler(CallbackQueryHandler(handle_rating_callback, pattern=r"^tool_rating:"))
 
     # Topic / Graph
     app.add_handler(CommandHandler("commands", commands_cmd))
     app.add_handler(CommandHandler("topic", topic_cmd))
     app.add_handler(CommandHandler("graph", graph_cmd))
-
-    # Document and photo handlers (RAG + Vision)
-    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
     # Text logger + reply logic
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
