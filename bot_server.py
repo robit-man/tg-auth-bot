@@ -11,7 +11,7 @@ Python 3.10+
 # ──────────────────────────────────────────────────────────────
 # BOOTSTRAP: STDLIB IMPORTS ONLY
 # ──────────────────────────────────────────────────────────────
-import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, math, random, asyncio, socket, threading, queue, traceback, glob
+import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, math, random, asyncio, socket, threading, queue, traceback, glob, html
 from collections import defaultdict
 from pathlib import Path
 from contextlib import closing
@@ -497,6 +497,7 @@ DEBUG_CONTEXTS: Dict[tuple[int, int], Dict[str, str]] = {}
 # 2) Paths + shard dirs
 # ──────────────────────────────────────────────────────────────
 DATA_DIR = ROOT / "data"
+ERROR_LOG_PATH = DATA_DIR / "handler_errors.log"
 USERS_DIR = DATA_DIR / "users"
 CHANNELS_DIR = DATA_DIR / "channels"
 for d in (DATA_DIR, USERS_DIR, CHANNELS_DIR):
@@ -4554,12 +4555,141 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────
 # 20) Error handler
 # ──────────────────────────────────────────────────────────────
+def _summarize_update_for_error(update: object) -> str:
+    if not isinstance(update, Update):
+        return repr(update)
+
+    parts: list[str] = []
+    user = update.effective_user
+    chat = update.effective_chat
+    msg = update.effective_message
+
+    if user:
+        parts.append(f"user_id={user.id}")
+        if user.username:
+            parts.append(f"username=@{user.username}")
+    if chat:
+        parts.append(f"chat_id={chat.id}")
+        parts.append(f"chat_type={chat.type}")
+    if msg:
+        snippet = (msg.text or msg.caption or "").replace("\n", " ").strip()
+        if snippet:
+            if len(snippet) > 180:
+                snippet = snippet[:177] + "..."
+            parts.append(f"text={snippet}")
+
+    return " ".join(parts) if parts else "(no update context)"
+
+
+def _append_handler_error_log(update_info: str, trace_text: str) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    entry = [
+        "=" * 60,
+        f"{timestamp}",
+        update_info or "(no update context)",
+        (trace_text or "No traceback captured.").rstrip(),
+        "",
+    ]
+    try:
+        with ERROR_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(entry))
+    except Exception as log_exc:
+        print(f"[error-log] Failed to persist handler error: {log_exc}", file=sys.stderr)
+
+
+def _tail_traceback_text(trace_text: str, *, max_chars: int = 3500, max_lines: int = 12) -> tuple[str, bool]:
+    stripped = (trace_text or "").strip()
+    if not stripped:
+        return "", False
+
+    lines = stripped.splitlines()
+    truncated = False
+    if max_lines and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+
+    snippet = "\n".join(lines).strip()
+    if max_chars and len(snippet) > max_chars:
+        snippet = snippet[-max_chars:]
+        truncated = True
+
+    return snippet, truncated
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     try:
+        exc = getattr(context, "error", None)
+        trace_text = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        ) if exc else "No exception information available."
+
+        update_info = _summarize_update_for_error(update)
+
         print("Exception in handler:", file=sys.stderr)
-        traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+        if exc:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+        else:
+            print("No exception object available.", file=sys.stderr)
+
+        _append_handler_error_log(update_info, trace_text)
+
+        notified_ids: set[int] = set()
+
         if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text("⚠️ An internal error occurred. Logged.")
+            snippet, truncated = _tail_traceback_text(trace_text)
+            snippet_html = html.escape(snippet) if snippet else ""
+
+            context_snippet = update_info
+            if len(context_snippet) > 500:
+                context_snippet = context_snippet[:497] + "..."
+
+            lines = [
+                "⚠️ Handler error encountered.",
+                "Full traceback saved to <code>data/handler_errors.log</code>.",
+            ]
+            if context_snippet:
+                lines.append(f"Context: <code>{html.escape(context_snippet)}</code>")
+            if snippet_html:
+                label = "Last traceback lines"
+                if truncated:
+                    label += " (truncated)"
+                lines.append(f"{label}:<br><pre>{snippet_html}</pre>")
+
+            message_body = "<br>".join(lines)
+            try:
+                await update.effective_message.reply_text(message_body, parse_mode="HTML")
+                if update.effective_user:
+                    notified_ids.add(update.effective_user.id)
+            except Exception:
+                pass
+
+        bot = getattr(context, "bot", None)
+        if bot and ADMIN_WHITELIST:
+            admin_snippet, admin_truncated = _tail_traceback_text(
+                trace_text, max_chars=3500, max_lines=20
+            )
+            admin_snippet_html = html.escape(admin_snippet) if admin_snippet else ""
+
+            admin_lines = [
+                "⚠️ Handler error detected.",
+                f"Context: <code>{html.escape(update_info[:800])}</code>" if update_info else "Context: (none)",
+                "Full traceback saved to <code>data/handler_errors.log</code>.",
+            ]
+            if admin_snippet_html:
+                label = "Traceback tail"
+                if admin_truncated:
+                    label += " (truncated)"
+                admin_lines.append(f"{label}:<br><pre>{admin_snippet_html}</pre>")
+
+            admin_message = "<br>".join(admin_lines)
+
+            for admin_id in ADMIN_WHITELIST:
+                if admin_id in notified_ids:
+                    continue
+                try:
+                    await bot.send_message(admin_id, admin_message, parse_mode="HTML")
+                except Exception:
+                    continue
     except Exception:
         pass
 

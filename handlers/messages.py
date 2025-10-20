@@ -8,8 +8,6 @@ Note: The on_text handler is complex and tightly integrated with many systems
 bot_server. Future refactoring should break it into smaller, testable pieces.
 """
 
-import sys
-import traceback
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -52,19 +50,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """
     Handle errors that occur during message processing
     """
-    try:
-        print("Exception in handler:", file=sys.stderr)
-        traceback.print_exception(
-            type(context.error),
-            context.error,
-            context.error.__traceback__
-        )
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ An internal error occurred. Logged."
-            )
-    except Exception:
-        pass
+    await bot_server.on_error(update, context)
 
 
 # ──────────────────────────────────────────────────────────────
