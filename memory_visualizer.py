@@ -54,9 +54,12 @@ class MemoryVisualizer:
         self.sleep_cycle_count = 0
         self.sleep_discoveries = {}
 
+<<<<<<< HEAD
         # Emotion profile tracking
         self.emotion_log = deque(maxlen=12)
 
+=======
+>>>>>>> 8796b779538283139133e8c631cf0a8c9cd557e2
         # Visual state
         self.grid_width = 80
         self.grid_height = 20
@@ -203,8 +206,11 @@ class MemoryVisualizer:
             self._handle_autonomous_operation(data)
         elif msg_type == 'sleep_state':
             self._handle_sleep_state(data)
+<<<<<<< HEAD
         elif msg_type == 'emotion':
             self._handle_emotion(data)
+=======
+>>>>>>> 8796b779538283139133e8c631cf0a8c9cd557e2
 
     def _handle_recall(self, data: dict):
         """Handle a memory recall event"""
@@ -270,6 +276,7 @@ class MemoryVisualizer:
         if self.sleep_state != 'awake':
             self.autonomous_indicator = max(self.autonomous_indicator, 20)
 
+<<<<<<< HEAD
     def _handle_emotion(self, data: dict):
         """Handle emotion profile updates"""
         if not isinstance(data, dict):
@@ -287,6 +294,8 @@ class MemoryVisualizer:
         }
         self.emotion_log.append(entry)
 
+=======
+>>>>>>> 8796b779538283139133e8c631cf0a8c9cd557e2
     def _spawn_memory_cell(self, memory_data: dict):
         """Spawn a new cell in the memory grid based on recall"""
         scope = memory_data.get('scope', 'unknown')
@@ -575,6 +584,7 @@ class MemoryVisualizer:
             consolidation_count = self.autonomous_stats.get('consolidations', 0)
             assessment_count = self.autonomous_stats.get('assessments', 0)
 
+<<<<<<< HEAD
             emotion_text = ""
             if self.emotion_log:
                 latest = self.emotion_log[-1]
@@ -586,6 +596,8 @@ class MemoryVisualizer:
                 else:
                     emotion_text = f" | EMOTION: {emotion} {confidence:.2f}"
 
+=======
+>>>>>>> 8796b779538283139133e8c631cf0a8c9cd557e2
             # Add sleep discoveries if in sleep state
             if self.sleep_state != 'awake' and self.sleep_discoveries:
                 patterns = self.sleep_discoveries.get('patterns', 0)
@@ -594,11 +606,19 @@ class MemoryVisualizer:
 
                 stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
                              f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count} "
+<<<<<<< HEAD
                              f"| SLEEP: P:{patterns} REL:{relationships} I:{insights}{emotion_text}")
             else:
                 stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
                              f"| Total:{total_count} Active:{active_cells} "
                              f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count}{emotion_text}")
+=======
+                             f"| SLEEP: P:{patterns} REL:{relationships} I:{insights}")
+            else:
+                stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
+                             f"| Total:{total_count} Active:{active_cells} "
+                             f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count}")
+>>>>>>> 8796b779538283139133e8c631cf0a8c9cd557e2
 
             if len(stats_text) < width - 4:
                 self.stdscr.addstr(stats_y, 2, stats_text, self.color_pairs.get('metadata', 0))
@@ -758,6 +778,7 @@ def update_sleep_state(state: str, time_in_state: float = 0, cycle_count: int = 
             pass
 
 
+<<<<<<< HEAD
 def log_emotion_state(**details):
     """Log an emotion profile update"""
     viz = get_visualizer()
@@ -771,6 +792,8 @@ def log_emotion_state(**details):
             pass
 
 
+=======
+>>>>>>> 8796b779538283139133e8c631cf0a8c9cd557e2
 if __name__ == "__main__":
     # Demo mode
     print("Starting Memory Visualizer Demo...")
