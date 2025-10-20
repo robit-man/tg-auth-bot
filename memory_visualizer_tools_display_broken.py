@@ -5,20 +5,12 @@ Memory Visualizer - Curses-based visualization of bot's internal memory states
 Displays memory recalls, scopes, and operations in a Game of Life-style ASCII interface
 """
 
-try:
-    import curses  # type: ignore
-    CURSES_AVAILABLE = True
-except Exception:
-    curses = None  # type: ignore
-    CURSES_AVAILABLE = False
+import curses
 import time
 import threading
 import queue
 import math
 import random
-import locale
-import os
-import sys
 from collections import deque
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
@@ -30,8 +22,6 @@ class MemoryVisualizer:
     def __init__(self):
         self.stdscr = None
         self.running = False
-        self.use_fallback = False
-        self.curses_available = CURSES_AVAILABLE
         self.update_queue = queue.Queue(maxsize=1000)
         self.recall_log = deque(maxlen=100)
 
@@ -64,13 +54,14 @@ class MemoryVisualizer:
         self.sleep_cycle_count = 0
         self.sleep_discoveries = {}
 
+        # Emotion profile tracking
+        self.emotion_log = deque(maxlen=12)
+
         # Visual state
         self.grid_width = 80
         self.grid_height = 20
         self.animation_frame = 0
         self.color_pairs = {}
-        self._last_console_render = 0.0
-        self._last_console_render = 0.0
 
         # Activity patterns (Game of Life style)
         self.activity_cells = set()  # Active cells that "live"
@@ -78,8 +69,6 @@ class MemoryVisualizer:
 
     def init_colors(self):
         """Initialize color pairs for different memory types"""
-        if not self.curses_available or not curses:
-            return
         if not curses.has_colors():
             return
 
@@ -107,32 +96,7 @@ class MemoryVisualizer:
 
     def start(self):
         """Start the curses visualization in a separate thread"""
-        if self.running:
-            return
-
         self.running = True
-
-        if not self.curses_available:
-            print("[visualizer] curses module not available – using console fallback renderer.")
-            self.use_fallback = True
-            self.vis_thread = threading.Thread(target=self._run_fallback, daemon=True)
-            self.vis_thread.start()
-            return
-
-        if not sys.stdout.isatty():
-            print("[visualizer] stdout is not a TTY; using console fallback renderer.")
-            self.use_fallback = True
-            self.vis_thread = threading.Thread(target=self._run_fallback, daemon=True)
-            self.vis_thread.start()
-            return
-
-        os.environ.setdefault("TERM", "xterm-256color")
-        try:
-            locale.setlocale(locale.LC_ALL, "")
-        except locale.Error:
-            pass
-
-        self.use_fallback = False
         self.vis_thread = threading.Thread(target=self._run_curses, daemon=True)
         self.vis_thread.start()
 
@@ -179,67 +143,11 @@ class MemoryVisualizer:
 
     def _run_curses(self):
         """Main curses loop"""
-        if not self.curses_available or not curses:
-            self.use_fallback = True
-            self._run_fallback()
-            return
         try:
             curses.wrapper(self._curses_main)
         except Exception as e:
-            self.running = False
-            print(f"[visualizer] Failed to start curses UI: {e}")
-            try:
-                if curses:
-                    curses.endwin()
-            except Exception:
-                pass
-            # Fallback to console mode if possible
-            if not self.use_fallback:
-                self.use_fallback = True
-                self.running = True
-                self._run_fallback()
-
-    def _run_fallback(self):
-        """Simple console renderer when curses is unavailable"""
-        while self.running:
-            updated = False
-            try:
-                msg_type, data = self.update_queue.get(timeout=0.5)
-                self._process_update(msg_type, data)
-                updated = True
-            except queue.Empty:
-                pass
-
-            now = time.time()
-            if updated or (now - self._last_console_render) > 1.5:
-                self._render_console(now)
-                self._last_console_render = now
-
-    def _render_console(self, timestamp: float):
-        """Render a compact textual snapshot to stdout"""
-        if self.recall_log:
-            recent = self.recall_log[-1]
-            scope = recent.get('scope', '?')
-            category = recent.get('category', '?')
-            content = recent.get('content', '')
-            weight = recent.get('weight', 0.0)
-            recall_line = f"{datetime.fromtimestamp(recent['time']).strftime('%H:%M:%S')} {scope}::{category} w={weight:.2f} {content}"
-        else:
-            recall_line = "(no recalls yet)"
-
-        stats = self.memory_stats
-        stats_line = f"thread={stats.get('thread',0)} user={stats.get('user',0)} global={stats.get('global',0)} total_recalls={stats.get('total_recalls',0)}"
-
-        sleep_line = f"sleep_state={self.sleep_state} time_in_state={self.sleep_time_in_state:.0f}s cycles={self.sleep_cycle_count}"
-
-        print(f"[visualizer] {timestamp:.0f} | {recall_line}")
-        print(f"[visualizer] stats: {stats_line}")
-        print(f"[visualizer] sleep: {sleep_line}")
-        if self.autonomous_ops:
-            last_auto = self.autonomous_ops[-1]
-            auto_line = f"{last_auto.get('type','?')} scope={last_auto.get('scope','?')} count={last_auto.get('count',0)}"
-            print(f"[visualizer] last autonomous: {auto_line}")
-        print("-" * 60)
+            # Silently handle curses errors
+            pass
 
     def _curses_main(self, stdscr):
         """Main curses display function"""
@@ -295,6 +203,8 @@ class MemoryVisualizer:
             self._handle_autonomous_operation(data)
         elif msg_type == 'sleep_state':
             self._handle_sleep_state(data)
+        elif msg_type == 'emotion':
+            self._handle_emotion(data)
 
     def _handle_recall(self, data: dict):
         """Handle a memory recall event"""
@@ -359,6 +269,23 @@ class MemoryVisualizer:
         # Visual indicator for sleep state changes
         if self.sleep_state != 'awake':
             self.autonomous_indicator = max(self.autonomous_indicator, 20)
+
+    def _handle_emotion(self, data: dict):
+        """Handle emotion profile updates"""
+        if not isinstance(data, dict):
+            return
+        entry = {
+            'time': data.get('time', time.time()),
+            'emotion': data.get('emotion', '(unknown)'),
+            'intent': data.get('intent', ''),
+            'tone': data.get('tone', ''),
+            'confidence': float(data.get('confidence', 0.0) or 0.0),
+            'user_id': data.get('user_id'),
+            'chat_id': data.get('chat_id'),
+            'tool': data.get('tool'),
+            'message_excerpt': data.get('message_excerpt', ''),
+        }
+        self.emotion_log.append(entry)
 
     def _spawn_memory_cell(self, memory_data: dict):
         """Spawn a new cell in the memory grid based on recall"""
@@ -648,6 +575,17 @@ class MemoryVisualizer:
             consolidation_count = self.autonomous_stats.get('consolidations', 0)
             assessment_count = self.autonomous_stats.get('assessments', 0)
 
+            emotion_text = ""
+            if self.emotion_log:
+                latest = self.emotion_log[-1]
+                emotion = latest.get('emotion', '(unknown)')
+                tone = latest.get('tone', '')
+                confidence = latest.get('confidence', 0.0)
+                if tone:
+                    emotion_text = f" | EMOTION: {emotion} ({tone}) {confidence:.2f}"
+                else:
+                    emotion_text = f" | EMOTION: {emotion} {confidence:.2f}"
+
             # Add sleep discoveries if in sleep state
             if self.sleep_state != 'awake' and self.sleep_discoveries:
                 patterns = self.sleep_discoveries.get('patterns', 0)
@@ -656,11 +594,11 @@ class MemoryVisualizer:
 
                 stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
                              f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count} "
-                             f"| SLEEP: P:{patterns} REL:{relationships} I:{insights}")
+                             f"| SLEEP: P:{patterns} REL:{relationships} I:{insights}{emotion_text}")
             else:
                 stats_text = (f"T:{thread_count} U:{user_count} G:{global_count} "
                              f"| Total:{total_count} Active:{active_cells} "
-                             f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count}")
+                             f"| AUTO: R:{rollup_count} D:{decay_count} C:{consolidation_count} A:{assessment_count}{emotion_text}")
 
             if len(stats_text) < width - 4:
                 self.stdscr.addstr(stats_y, 2, stats_text, self.color_pairs.get('metadata', 0))
@@ -816,6 +754,19 @@ def update_sleep_state(state: str, time_in_state: float = 0, cycle_count: int = 
                 'cycle_count': cycle_count,
                 'discoveries': discoveries or {}
             }))
+        except queue.Full:
+            pass
+
+
+def log_emotion_state(**details):
+    """Log an emotion profile update"""
+    viz = get_visualizer()
+    if viz.running:
+        payload = dict(details)
+        if 'time' not in payload:
+            payload['time'] = time.time()
+        try:
+            viz.update_queue.put_nowait(('emotion', payload))
         except queue.Full:
             pass
 

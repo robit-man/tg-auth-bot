@@ -22,13 +22,48 @@ try:
     VISUALIZER_AVAILABLE = True
 except ImportError:
     VISUALIZER_AVAILABLE = False
-    def start_visualizer(): pass
-    def log_recall(*args, **kwargs): pass
-    def log_operation(*args, **kwargs): pass
-    def update_stats(*args, **kwargs): pass
-    def log_autonomous(*args, **kwargs): pass
-    def update_sleep_state(*args, **kwargs): pass
-    def log_emotion_state(*args, **kwargs): pass
+    _fallback_visualizer_started = False
+
+    def _mv_fallback_log(kind: str, message: str = ""):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = f"[visualizer:{kind}]"
+        if message:
+            print(f"{prefix} {timestamp} {message}")
+        else:
+            print(f"{prefix} {timestamp}")
+
+    def start_visualizer():
+        global _fallback_visualizer_started
+        if not _fallback_visualizer_started:
+            _fallback_visualizer_started = True
+            _mv_fallback_log("fallback", "curses unavailable; logging to console only")
+
+    def log_recall(scope="?", category="?", content="", weight=0.0, metadata=None):
+        if _fallback_visualizer_started:
+            _mv_fallback_log("recall", f"{scope}::{category} w={weight:.2f} {content[:80]}")
+
+    def log_operation(operation: str, **details):
+        if _fallback_visualizer_started:
+            _mv_fallback_log("op", f"{operation} {details}")
+
+    def update_stats(**kwargs):
+        if _fallback_visualizer_started:
+            _mv_fallback_log("stats", str(kwargs))
+
+    def log_autonomous(*args, **kwargs):
+        if _fallback_visualizer_started:
+            payload = kwargs if kwargs else args
+            _mv_fallback_log("auto", str(payload))
+
+    def update_sleep_state(*args, **kwargs):
+        if _fallback_visualizer_started:
+            payload = kwargs if kwargs else args
+            _mv_fallback_log("sleep", str(payload))
+
+    def log_emotion_state(*args, **kwargs):
+        if _fallback_visualizer_started:
+            payload = kwargs if kwargs else args
+            _mv_fallback_log("emotion", str(payload))
 
 # Sleep cycle (optional - graceful degradation if import fails)
 try:
@@ -55,33 +90,54 @@ def _venv_python(p: Path) -> Path:
 def ensure_venv_and_deps():
     if os.environ.get("VIRTUAL_ENV") or str(sys.prefix).endswith(".venv"):
         return
+
+    force_bootstrap = os.environ.get("FORCE_BOOTSTRAP") == "1"
+    boot_flag = VENV / ".bootstrapped"
+
+    if VENV.exists() and boot_flag.exists() and not force_bootstrap:
+        py = str(_venv_python(VENV))
+        os.execv(py, [py, *sys.argv])
+
     if not VENV.exists():
         print("[bootstrap] Creating .venv ...")
         subprocess.check_call([sys.executable, "-m", "venv", str(VENV)])
+
     py = str(_venv_python(VENV))
     print("[bootstrap] Upgrading pip/setuptools/wheel ...")
     subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+
     reqs = [
         'python-telegram-bot[job-queue]>=20,<21',  # JobQueue included
         'APScheduler>=3.9,<4.0',
         "python-dotenv>=1.0,<2.0",
         "requests>=2.31,<3.0",
     ]
+
     tool_reqs = [
         "selenium>=4.17,<5.0",
         "webdriver-manager>=4.0,<5.0",
         "beautifulsoup4>=4.12,<5.0",
         "lxml>=4.9,<6.0",
-        "ollama>=0.1,<1.0",
     ]
+
     print("[bootstrap] Installing core requirements ...")
     subprocess.check_call([py, "-m", "pip", "install", *reqs])
+
     print("[bootstrap] Installing toolchain extras ...")
     for pkg in tool_reqs:
         try:
             subprocess.check_call([py, "-m", "pip", "install", pkg])
         except subprocess.CalledProcessError as exc:
             print(f"[bootstrap] Warning: failed to install optional package '{pkg}': {exc}")
+
+    try:
+        boot_flag.write_text(f"bootstrapped at {datetime.now().isoformat()}\n")
+    except Exception:
+        pass
+
+    print("[bootstrap] Optional Ollama Python client not installed automatically.\n"
+          "           Install it manually after reconciling dependencies if you need the SDK.")
+
     print("[bootstrap] Re-exec in .venv ...")
     os.execv(py, [py, *sys.argv])
 
@@ -362,12 +418,11 @@ def init_intelligent_components():
 def admin_only(fn):
     @wraps(fn)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat = update.effective_chat
-        user = update.effective_user
-        if not chat or chat.type not in ("group", "supergroup"):
+        chat = update.effective_chat; user = update.effective_user
+        if not chat or chat.type not in ("group","supergroup"):
             return await update.effective_message.reply_text("Run this in a group.")
         member = await context.bot.get_chat_member(chat.id, user.id)
-        if member.status not in ("administrator", "creator"):
+        if member.status not in ("administrator","creator"):
             return await update.effective_message.reply_text("Admins only.")
         return await fn(update, context)
     return wrapper
@@ -2188,7 +2243,6 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
                         schemas,
                         categories=None,  # Show all categories
                         max_tools=30,  # Limit to prevent context overflow
-                        include_examples=True,
                     )
                 else:
                     # Fallback to simple signatures
@@ -4467,12 +4521,13 @@ def main():
     start_auto_reloader()
 
     # Start memory visualizer if available and enabled
-    if VISUALIZER_AVAILABLE and MEMORY_VISUALIZER_ENABLED:
-        print("[visualizer] Starting memory consciousness visualizer...")
-        start_visualizer()
-        print("[visualizer] Visualizer running. Press 'q' in the visualizer to close it.")
-    elif MEMORY_VISUALIZER_ENABLED and not VISUALIZER_AVAILABLE:
-        print("[visualizer] Memory visualizer enabled but module not available. Install curses support.")
+    if MEMORY_VISUALIZER_ENABLED:
+        if VISUALIZER_AVAILABLE:
+            print("[visualizer] Starting memory consciousness visualizer...")
+            start_visualizer()
+            print("[visualizer] Visualizer running. Press 'q' in the visualizer to close it.")
+        else:
+            start_visualizer()
 
     # Ensure base schema present
     with closing(db()): pass
