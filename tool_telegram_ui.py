@@ -11,6 +11,7 @@ Provides:
 
 import asyncio
 from typing import Any, Optional
+import html
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.ext import ContextTypes
 
@@ -95,15 +96,16 @@ class ToolTelegramUI:
         tool_name = tool_decision.tool_name or "Unknown"
         args_preview = ", ".join(
             f"{k}={repr(v)[:50]}" for k, v in tool_decision.tool_args.items()
-        )
+        ) or "(no arguments)"
+        reasoning_text = tool_decision.reasoning or "(no reasoning provided)"
 
         message_text = (
-            f"🤖 **Tool Decision**\n\n"
-            f"**Tool:** `{tool_name}`\n"
-            f"**Arguments:** {args_preview}\n"
-            f"**Confidence:** {tool_decision.confidence:.1%}\n"
-            f"**Reasoning:** {tool_decision.reasoning}\n\n"
-            f"Execute this tool?"
+            "🤖 <b>Tool Decision</b>\n\n"
+            f"<b>Tool:</b> <code>{html.escape(tool_name)}</code>\n"
+            f"<b>Arguments:</b> {html.escape(args_preview) or 'None'}\n"
+            f"<b>Confidence:</b> {html.escape(f'{tool_decision.confidence:.1%}')}\n"
+            f"<b>Reasoning:</b> {html.escape(reasoning_text)}\n\n"
+            "Execute this tool?"
         )
 
         keyboard = ToolTelegramUI.create_tool_confirmation_keyboard(tool_decision)
@@ -111,7 +113,7 @@ class ToolTelegramUI:
         return await update.effective_message.reply_text(
             message_text,
             reply_markup=keyboard,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
 
     @staticmethod
@@ -138,8 +140,8 @@ class ToolTelegramUI:
 
         try:
             await message.edit_text(
-                f"{icon} **{stage.title()}**\n\n{details}",
-                parse_mode="Markdown",
+                f"{icon} <b>{html.escape(stage.title())}</b>\n\n{html.escape(details or '')}",
+                parse_mode="HTML",
             )
         except Exception:
             # Ignore edit failures (message might be too old)
@@ -155,20 +157,28 @@ class ToolTelegramUI:
         Edit message to show tool result and add rating buttons.
         """
         if tool_result.success:
+            result_payload = tool_result.formatted_output or tool_result.output
+            result_body = str(result_payload)
+            if len(result_body) > 1500:
+                result_body = result_body[:1497] + "..."
+            result_body_escaped = html.escape(result_body)
             result_text = (
-                f"✅ **Tool Executed Successfully**\n\n"
-                f"**Tool:** `{tool_result.tool_name}`\n"
-                f"**Time:** {tool_result.execution_time:.2f}s\n\n"
-                f"**Result:**\n{tool_result.formatted_output or tool_result.output}\n\n"
-                f"Rate this response:"
+                "✅ <b>Tool Executed Successfully</b>\n\n"
+                f"<b>Tool:</b> <code>{html.escape(tool_result.tool_name)}</code>\n"
+                f"<b>Time:</b> {html.escape(f'{tool_result.execution_time:.2f}s')}\n\n"
+                f"<b>Result:</b>\n<pre>{result_body_escaped}</pre>\n\n"
+                "Rate this response:"
             )
         else:
+            error_text = tool_result.error or "Unknown error"
+            if len(error_text) > 1500:
+                error_text = error_text[:1497] + "..."
             result_text = (
-                f"❌ **Tool Execution Failed**\n\n"
-                f"**Tool:** `{tool_result.tool_name}`\n"
-                f"**Time:** {tool_result.execution_time:.2f}s\n"
-                f"**Error:** {tool_result.error}\n\n"
-                f"Rate this response:"
+                "❌ <b>Tool Execution Failed</b>\n\n"
+                f"<b>Tool:</b> <code>{html.escape(tool_result.tool_name)}</code>\n"
+                f"<b>Time:</b> {html.escape(f'{tool_result.execution_time:.2f}s')}\n"
+                f"<b>Error:</b> <pre>{html.escape(error_text)}</pre>\n\n"
+                "Rate this response:"
             )
 
         rating_keyboard = ToolTelegramUI.create_rating_keyboard()
@@ -177,7 +187,7 @@ class ToolTelegramUI:
             await message.edit_text(
                 result_text,
                 reply_markup=rating_keyboard,
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
         except Exception as e:
             # If can't edit (message too long), send new message

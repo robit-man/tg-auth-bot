@@ -67,7 +67,7 @@ class RealToolExecutor:
         tool_name: str,
         tool_args: Dict[str, Any],
         *,
-        timeout: float = 30.0,
+        timeout: float = 180.0,
         progress_callback: Optional[callable] = None,
     ) -> ToolExecutionResult:
         """
