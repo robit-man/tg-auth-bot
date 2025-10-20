@@ -834,7 +834,7 @@ class Tools:
     # ===================== Main tool: search_internet =====================
 
     @staticmethod
-    def search_internet(topic: str,
+    def search_internet(topic: str = "",
                         num_results: int = 1,
                         wait_sec: int = 1,
                         deep_scrape: bool = True,

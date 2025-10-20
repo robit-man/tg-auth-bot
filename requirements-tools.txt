@@ -1,0 +1,9 @@
+# Auto-generated - dependencies are auto-installed on first run
+beautifulsoup4
+lxml
+requests
+selenium
+webdriver-manager
+ollama
+python-telegram-bot
+python-dotenv

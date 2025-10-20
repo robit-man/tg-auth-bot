@@ -27,10 +27,11 @@ from datetime import datetime
 class MemoryVisualizer:
     """Beautiful curses-based memory state visualizer with Game of Life aesthetics"""
 
-    def __init__(self):
+    def __init__(self, force_curses=False):
         self.stdscr = None
         self.running = False
         self.use_fallback = False
+        self.force_curses = force_curses  # Force curses mode even without TTY
         self.curses_available = CURSES_AVAILABLE
         self.update_queue = queue.Queue(maxsize=1000)
         self.recall_log = deque(maxlen=100)
@@ -119,8 +120,9 @@ class MemoryVisualizer:
             self.vis_thread.start()
             return
 
-        if not sys.stdout.isatty():
+        if not sys.stdout.isatty() and not self.force_curses:
             print("[visualizer] stdout is not a TTY; using console fallback renderer.")
+            print("[visualizer] Set FORCE_CURSES=true to force curses mode.")
             self.use_fallback = True
             self.vis_thread = threading.Thread(target=self._run_fallback, daemon=True)
             self.vis_thread.start()
@@ -493,14 +495,14 @@ class MemoryVisualizer:
         """Draw the main border"""
         try:
             # Top border
-            self.stdscr.addstr(0, 0, "╔" + "═" * (width - 2) + "╗", self.color_pairs.get('metadata', 0))
+            self.stdscr.addstr(0, 0, "+" + "-" * (width - 2) + "+", self.color_pairs.get('metadata', 0))
             # Bottom border
             if height > 1:
-                self.stdscr.addstr(height - 1, 0, "╚" + "═" * (width - 2) + "╝", self.color_pairs.get('metadata', 0))
+                self.stdscr.addstr(height - 1, 0, "+" + "-" * (width - 2) + "+", self.color_pairs.get('metadata', 0))
             # Side borders
             for y in range(1, height - 1):
-                self.stdscr.addstr(y, 0, "║", self.color_pairs.get('metadata', 0))
-                self.stdscr.addstr(y, width - 1, "║", self.color_pairs.get('metadata', 0))
+                self.stdscr.addstr(y, 0, "|", self.color_pairs.get('metadata', 0))
+                self.stdscr.addstr(y, width - 1, "|", self.color_pairs.get('metadata', 0))
         except curses.error:
             pass
 
@@ -509,15 +511,15 @@ class MemoryVisualizer:
         try:
             # Sleep state symbols
             sleep_symbols = {
-                'awake': '⚡',
+                'awake': '*',
                 'drowsy': '~',
-                'light_sleep': '⌇',
-                'deep_sleep': '≋',
-                'rem_sleep': '✧',
-                'waking': '↑'
+                'light_sleep': '-',
+                'deep_sleep': '=',
+                'rem_sleep': '+',
+                'waking': '^'
             }
 
-            symbol = sleep_symbols.get(self.sleep_state, '⚡')
+            symbol = sleep_symbols.get(self.sleep_state, '*')
 
             if self.sleep_state == 'awake':
                 title = f"{symbol} MEMORY CONSCIOUSNESS VISUALIZER {symbol}"
@@ -542,13 +544,13 @@ class MemoryVisualizer:
 
             # Color based on sleep state
             if self.sleep_state == 'rem_sleep':
-                title_color = self.color_pairs.get('high_weight', curses.A_BOLD)
+                title_color = self.color_pairs.get('high_weight', 0) or curses.A_BOLD
             elif self.sleep_state in ('deep_sleep', 'light_sleep'):
-                title_color = self.color_pairs.get('user', curses.A_BOLD)
+                title_color = self.color_pairs.get('user', 0) or curses.A_BOLD
             elif self.sleep_state == 'drowsy':
-                title_color = self.color_pairs.get('metadata', curses.A_BOLD)
+                title_color = self.color_pairs.get('metadata', 0) or curses.A_BOLD
             else:
-                title_color = self.color_pairs.get('active', curses.A_BOLD)
+                title_color = self.color_pairs.get('active', 0) or curses.A_BOLD
 
             self.stdscr.addstr(1, title_x, title, title_color)
             self.stdscr.addstr(1, status_x, status, self.color_pairs.get('metadata', 0))
@@ -595,26 +597,26 @@ class MemoryVisualizer:
                 # Special rendering for autonomous operations
                 if is_autonomous:
                     # Autonomous operations use special characters
-                    chars = ['⚙', '⚡', '◉', '◈', '◆']
+                    chars = ['[A]', '*', '@', '%', '*']
                     char = chars[self.animation_frame % len(chars)]
-                    color = self.color_pairs.get('high_weight', curses.A_BOLD)
+                    color = self.color_pairs.get('high_weight', 0) or curses.A_BOLD
                 else:
                     # Character progression based on weight
                     if weight > 0.8:
-                        char = '█'  # Solid block for high weight
+                        char = '#'  # Solid block for high weight
                     elif weight > 0.6:
-                        char = '▓'  # Dark shade
+                        char = '='  # Dark shade
                     elif weight > 0.4:
-                        char = '▒'  # Medium shade
+                        char = '-'  # Medium shade
                     elif weight > 0.2:
-                        char = '░'  # Light shade
+                        char = '.'  # Light shade
                     else:
-                        char = '·'  # Dot for low weight
+                        char = ','  # Dot for low weight
 
                     # Animate based on frame
                     if (cell_x, cell_y) in self.activity_cells:
                         if self.animation_frame % 4 < 2:
-                            char = '◆'  # Active indicator
+                            char = '*'  # Active indicator
 
                     # Get color for scope
                     color = self.color_pairs.get(scope, self.color_pairs.get('default', 0))
@@ -693,7 +695,7 @@ class MemoryVisualizer:
                 count = recent.get('count', 0)
 
                 timestamp = datetime.fromtimestamp(recent['time']).strftime('%H:%M:%S')
-                log_text = f"[{timestamp}] ⚙ AUTONOMOUS: {op_type.upper()}"
+                log_text = f"[{timestamp}] [A] AUTONOMOUS: {op_type.upper()}"
                 if scope:
                     log_text += f" scope={scope}"
                 if count:
@@ -706,7 +708,7 @@ class MemoryVisualizer:
                 if len(log_text) > max_len:
                     log_text = log_text[:max_len - 3] + "..."
 
-                color = self.color_pairs.get('high_weight', curses.A_BOLD)
+                color = self.color_pairs.get('high_weight', 0) or curses.A_BOLD
                 self.stdscr.addstr(log_y, 2, log_text, color)
 
             elif self.recall_log:
@@ -744,17 +746,21 @@ class MemoryVisualizer:
 _visualizer: Optional[MemoryVisualizer] = None
 
 
-def get_visualizer() -> MemoryVisualizer:
+def get_visualizer(force_curses=False) -> MemoryVisualizer:
     """Get or create the global visualizer instance"""
     global _visualizer
     if _visualizer is None:
-        _visualizer = MemoryVisualizer()
+        _visualizer = MemoryVisualizer(force_curses=force_curses)
     return _visualizer
 
 
-def start_visualizer():
-    """Start the memory visualizer"""
-    viz = get_visualizer()
+def start_visualizer(force_curses=False):
+    """Start the memory visualizer
+
+    Args:
+        force_curses: If True, force curses mode even without a TTY (requires tmux/screen)
+    """
+    viz = get_visualizer(force_curses=force_curses)
     if not viz.running:
         viz.start()
     return viz

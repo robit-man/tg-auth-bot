@@ -284,6 +284,10 @@ Examples:
             content = data.get("message", {}).get("content", "{}")
             decision_data = json.loads(content)
 
+            # Debug logging
+            print(f"[tool_decision] LLM response: {content[:200]}")
+            print(f"[tool_decision] Parsed tool_args: {decision_data.get('tool_args', {})}")
+
             # Parse decision
             needs_tool = decision_data.get("needs_tool", False)
             tool_name = decision_data.get("tool_name")

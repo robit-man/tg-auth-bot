@@ -8,6 +8,9 @@ and privacy-aware per-user "interaction profiles" updated during idle time.
 Python 3.10+
 """
 
+# ──────────────────────────────────────────────────────────────
+# BOOTSTRAP: STDLIB IMPORTS ONLY
+# ──────────────────────────────────────────────────────────────
 import os, sys, subprocess, textwrap, sqlite3, base64, secrets, re, time, json, math, random, asyncio, socket, threading, queue, traceback, glob
 from collections import defaultdict
 from pathlib import Path
@@ -16,54 +19,10 @@ from functools import wraps, lru_cache
 from typing import Optional, Tuple, List, Iterable, Dict, Callable, Any
 from datetime import datetime, timezone
 
-# Memory visualizer (optional - graceful degradation if import fails)
-try:
-    from memory_visualizer import start_visualizer, log_recall, log_operation, update_stats, log_autonomous, update_sleep_state, log_emotion_state
-    VISUALIZER_AVAILABLE = True
-except ImportError:
-    VISUALIZER_AVAILABLE = False
-    _fallback_visualizer_started = False
-
-    def _mv_fallback_log(kind: str, message: str = ""):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        prefix = f"[visualizer:{kind}]"
-        if message:
-            print(f"{prefix} {timestamp} {message}")
-        else:
-            print(f"{prefix} {timestamp}")
-
-    def start_visualizer():
-        global _fallback_visualizer_started
-        if not _fallback_visualizer_started:
-            _fallback_visualizer_started = True
-            _mv_fallback_log("fallback", "curses unavailable; logging to console only")
-
-    def log_recall(scope="?", category="?", content="", weight=0.0, metadata=None):
-        if _fallback_visualizer_started:
-            _mv_fallback_log("recall", f"{scope}::{category} w={weight:.2f} {content[:80]}")
-
-    def log_operation(operation: str, **details):
-        if _fallback_visualizer_started:
-            _mv_fallback_log("op", f"{operation} {details}")
-
-    def update_stats(**kwargs):
-        if _fallback_visualizer_started:
-            _mv_fallback_log("stats", str(kwargs))
-
-    def log_autonomous(*args, **kwargs):
-        if _fallback_visualizer_started:
-            payload = kwargs if kwargs else args
-            _mv_fallback_log("auto", str(payload))
-
-    def update_sleep_state(*args, **kwargs):
-        if _fallback_visualizer_started:
-            payload = kwargs if kwargs else args
-            _mv_fallback_log("sleep", str(payload))
-
-    def log_emotion_state(*args, **kwargs):
-        if _fallback_visualizer_started:
-            payload = kwargs if kwargs else args
-            _mv_fallback_log("emotion", str(payload))
+# ──────────────────────────────────────────────────────────────
+# VISUALIZER/SLEEP IMPORTS HAPPEN AFTER VENV BOOTSTRAP
+# They are imported later in the file after ensure_venv_and_deps()
+# ──────────────────────────────────────────────────────────────
 
 # Sleep cycle (optional - graceful degradation if import fails)
 try:
@@ -106,6 +65,7 @@ def ensure_venv_and_deps():
     print("[bootstrap] Upgrading pip/setuptools/wheel ...")
     subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
 
+    # Core requirements - MUST install
     reqs = [
         'python-telegram-bot[job-queue]>=20,<21',  # JobQueue included
         'APScheduler>=3.9,<4.0',
@@ -113,35 +73,116 @@ def ensure_venv_and_deps():
         "requests>=2.31,<3.0",
     ]
 
+    # Tool requirements - for search_internet and other tools
     tool_reqs = [
         "selenium>=4.17,<5.0",
         "webdriver-manager>=4.0,<5.0",
         "beautifulsoup4>=4.12,<5.0",
         "lxml>=4.9,<6.0",
+        "ollama>=0.1.0",  # For LLM operations
     ]
 
     print("[bootstrap] Installing core requirements ...")
-    subprocess.check_call([py, "-m", "pip", "install", *reqs])
-
-    print("[bootstrap] Installing toolchain extras ...")
-    for pkg in tool_reqs:
-        try:
-            subprocess.check_call([py, "-m", "pip", "install", pkg])
-        except subprocess.CalledProcessError as exc:
-            print(f"[bootstrap] Warning: failed to install optional package '{pkg}': {exc}")
-
+    core_failed = False
     try:
-        boot_flag.write_text(f"bootstrapped at {datetime.now().isoformat()}\n")
-    except Exception:
-        pass
+        subprocess.check_call([py, "-m", "pip", "install", *reqs])
+        print("[bootstrap]   ✓ Core requirements installed")
+    except subprocess.CalledProcessError as exc:
+        core_failed = True
+        print(f"[bootstrap]   ✗ Core requirements FAILED: {exc}")
+        print("[bootstrap]   Will retry on next run")
 
-    print("[bootstrap] Optional Ollama Python client not installed automatically.\n"
-          "           Install it manually after reconciling dependencies if you need the SDK.")
+    print("[bootstrap] Installing tool requirements ...")
+    failed = []
+    for pkg in tool_reqs:
+        pkg_name = pkg.split('>=')[0]
+        try:
+            print(f"[bootstrap]   Installing {pkg_name}...", end=" ", flush=True)
+            result = subprocess.run(
+                [py, "-m", "pip", "install", pkg],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            if result.returncode == 0:
+                print("✓")
+            else:
+                print("✗ FAILED")
+                if result.stderr:
+                    print(f"[bootstrap]     Error: {result.stderr[:200]}")
+                failed.append(pkg_name)
+        except Exception as exc:
+            print("✗ ERROR")
+            print(f"[bootstrap]     Exception: {exc}")
+            failed.append(pkg_name)
+
+    # Only create bootstrap flag if ALL packages installed successfully
+    if not core_failed and not failed:
+        try:
+            boot_flag.write_text(f"bootstrapped at {datetime.now().isoformat()}\n")
+            print("[bootstrap] ✓ All dependencies installed successfully!")
+        except Exception:
+            pass
+    else:
+        if failed:
+            print(f"[bootstrap] ⚠ {len(failed)} packages failed: {', '.join(failed)}")
+        print("[bootstrap] ⚠ Bootstrap incomplete - will retry on next run")
 
     print("[bootstrap] Re-exec in .venv ...")
     os.execv(py, [py, *sys.argv])
 
 ensure_venv_and_deps()
+
+# ──────────────────────────────────────────────────────────────
+# NOW IN VENV - IMPORT THIRD-PARTY MODULES
+# ──────────────────────────────────────────────────────────────
+
+# Memory visualizer (optional - graceful degradation if import fails)
+try:
+    from memory_visualizer import start_visualizer, log_recall, log_operation, update_stats, log_autonomous, update_sleep_state
+    VISUALIZER_AVAILABLE = True
+    print("[bootstrap] ✓ Memory visualizer imported successfully")
+except ImportError as e:
+    VISUALIZER_AVAILABLE = False
+    _fallback_visualizer_started = False
+    print(f"[bootstrap] ✗ Memory visualizer import failed: {e}")
+    print("[bootstrap]   Using fallback console logging")
+
+    def _mv_fallback_log(kind: str, message: str = ""):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        prefix = f"[visualizer:{kind}]"
+        if message:
+            print(f"{prefix} {timestamp} {message}")
+        else:
+            print(f"{prefix} {timestamp}")
+
+    def start_visualizer(force_curses=False):
+        global _fallback_visualizer_started
+        if not _fallback_visualizer_started:
+            _fallback_visualizer_started = True
+            _mv_fallback_log("fallback", "curses unavailable; logging to console only")
+
+    def log_recall(scope="?", category="?", content="", weight=0.0, metadata=None):
+        if _fallback_visualizer_started:
+            _mv_fallback_log("recall", f"{scope}::{category} w={weight:.2f} {content[:80]}")
+
+    def log_operation(operation: str, **details):
+        if _fallback_visualizer_started:
+            _mv_fallback_log("op", f"{operation} {details}")
+
+    def update_stats(**kwargs):
+        if _fallback_visualizer_started:
+            _mv_fallback_log("stats", str(kwargs))
+
+    def log_autonomous(*args, **kwargs):
+        if _fallback_visualizer_started:
+            payload = kwargs if kwargs else args
+            _mv_fallback_log("auto", str(payload))
+
+    def update_sleep_state(*args, **kwargs):
+        if _fallback_visualizer_started:
+            payload = kwargs if kwargs else args
+            _mv_fallback_log("sleep", str(payload))
 
 # Inside venv
 import requests
@@ -153,6 +194,8 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 
+# Duplicate code removed - bootstrap runs at top of file
+
 try:
     from ai_tool_bridge import (
         TOOL_INTEGRATION_AVAILABLE,
@@ -160,11 +203,16 @@ try:
         EnhancedPromptBuilder,
         ToolExecutionCoordinator,
     )
-except ImportError:
+    if not BRIDGE_TOOLS_AVAILABLE:
+        print("[bootstrap] Tools unavailable - missing dependencies")
+        print("[bootstrap] Delete .venv/.bootstrapped and restart to retry install")
+except ImportError as e:
     TOOL_INTEGRATION_AVAILABLE = False
     BRIDGE_TOOLS_AVAILABLE = False
     EnhancedPromptBuilder = None  # type: ignore
     ToolExecutionCoordinator = None  # type: ignore
+    print(f"[bootstrap] Tool bridge import failed: {e}")
+    print("[bootstrap] Delete .venv/.bootstrapped and restart to retry install")
 
 try:
     from tool_integration import ToolInspector, build_tool_context_for_prompt
@@ -333,6 +381,7 @@ MEMORY_USER_LIMIT = int((os.getenv("MEMORY_USER_LIMIT") or (CFG.get("MEMORY_USER
 MEMORY_GLOBAL_LIMIT = int((os.getenv("MEMORY_GLOBAL_LIMIT") or (CFG.get("MEMORY_GLOBAL_LIMIT") or "80")).strip() or "80")
 MEMORY_SUMMARY_BATCH = int((os.getenv("MEMORY_SUMMARY_BATCH") or (CFG.get("MEMORY_SUMMARY_BATCH") or "10")).strip() or "10")
 MEMORY_VISUALIZER_ENABLED = ((os.getenv("MEMORY_VISUALIZER_ENABLED") or (CFG.get("MEMORY_VISUALIZER_ENABLED") or "true")).strip().lower() == "true")
+FORCE_CURSES = ((os.getenv("FORCE_CURSES") or (CFG.get("FORCE_CURSES") or "false")).strip().lower() == "true")
 
 SLEEP_CYCLE_ENABLED = ((os.getenv("SLEEP_CYCLE_ENABLED") or (CFG.get("SLEEP_CYCLE_ENABLED") or "true")).strip().lower() == "true")
 SLEEP_CYCLE_TICK_SECONDS = int((os.getenv("SLEEP_CYCLE_TICK_SECONDS") or (CFG.get("SLEEP_CYCLE_TICK_SECONDS") or "60")).strip() or "60")
@@ -4524,7 +4573,9 @@ def main():
     if MEMORY_VISUALIZER_ENABLED:
         if VISUALIZER_AVAILABLE:
             print("[visualizer] Starting memory consciousness visualizer...")
-            start_visualizer()
+            start_visualizer(force_curses=FORCE_CURSES)
+            if FORCE_CURSES:
+                print("[visualizer] Curses mode forced. Make sure you're running in tmux/screen!")
             print("[visualizer] Visualizer running. Press 'q' in the visualizer to close it.")
         else:
             start_visualizer()
