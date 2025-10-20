@@ -209,6 +209,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
+from telegram.error import BadRequest
 
 # Duplicate code removed - bootstrap runs at top of file
 
@@ -584,7 +585,7 @@ def log_chain_user_message(chat_id: int, thread_id: int | None, text: str, *, us
     dq.append(entry)
 
 
-def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, tool_entries: Optional[Iterable[Any]] = None, message_id: Optional[int] = None) -> None:
+def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, tool_entries: Optional[Iterable[Any]] = None, message_id: Optional[int] = None, raw_tool_entries: Optional[List[Dict[str, str]]] = None) -> None:
     if not text:
         return
     response_data = {
@@ -592,8 +593,24 @@ def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, too
         "assistant_raw": text,
         "assistant_message_id": message_id,
         "tools": _condense_tool_entries(tool_entries),
+        "tools_raw": [],
         "ts": time.time(),
     }
+    raw_records: List[Dict[str, str]] = []
+    if tool_entries:
+        for entry in tool_entries:
+            try:
+                name = str(entry.get("tool", "tool"))
+            except AttributeError:
+                name = "tool"
+            raw_text = ""
+            if isinstance(entry, dict):
+                raw_text = str(entry.get("result_full") or entry.get("result_preview") or "")
+            if raw_text:
+                raw_records.append({"tool": name, "output": raw_text})
+    if raw_tool_entries:
+        raw_records.extend(raw_tool_entries)
+    response_data["tools_raw"] = raw_records
     dq = _get_chain_log(chat_id, thread_id)
     if dq and "assistant" not in dq[-1]:
         dq[-1].update(response_data)
@@ -626,6 +643,35 @@ def build_chain_summary(chat_id: int, thread_id: int | None, limit: int = 10) ->
     return "\n".join(lines)
 
 
+def format_recent_tool_outputs(chat_id: int, thread_id: int | None, *, limit: int = 6, max_chars: int = 1200) -> str:
+    dq = CHAIN_LOGS.get(_chain_key(chat_id, thread_id))
+    if not dq:
+        return "(no tool outputs recorded)"
+
+    lines: List[str] = []
+    total = 0
+    count = 0
+    for entry in reversed(dq):
+        raw_entries = entry.get("tools_raw") or []
+        for raw in raw_entries:
+            tool_name = raw.get("tool", "tool")
+            raw_text = raw.get("output", "")
+            if not raw_text:
+                continue
+            count += 1
+            line = f"{count}. {tool_name}: {raw_text}"
+            snippet = textwrap.shorten(line, width=360, placeholder=" …")
+            if total + len(snippet) + 1 > max_chars:
+                lines.append("… (truncated)")
+                return "\n".join(lines)
+            lines.append(snippet)
+            total += len(snippet) + 1
+            if count >= limit:
+                return "\n".join(lines)
+
+    return "\n".join(lines) if lines else "(no tool outputs recorded)"
+
+
 def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 8, max_chars: int = 1200) -> str:
     dq = CHAIN_LOGS.get(_chain_key(chat_id, thread_id))
     if not dq:
@@ -652,7 +698,20 @@ def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 
 
         for tool_entry in entry.get("tools") or []:
             tool_line = f"    🛠️ {tool_entry}"
-            snippet = textwrap.shorten(tool_line, width=240, placeholder=" …")
+            snippet = textwrap.shorten(tool_line, width=300, placeholder=" …")
+            if total + len(snippet) + 1 > max_chars:
+                lines.append("… (truncated)")
+                return "\n".join(lines)
+            lines.append(snippet)
+            total += len(snippet) + 1
+
+        for raw_entry in entry.get("tools_raw") or []:
+            raw_tool = raw_entry.get("tool", "tool")
+            raw_text = raw_entry.get("output", "")
+            if not raw_text:
+                continue
+            raw_line = f"    🧪 {raw_tool}: {raw_text}"
+            snippet = textwrap.shorten(raw_line, width=360, placeholder=" …")
             if total + len(snippet) + 1 > max_chars:
                 lines.append("… (truncated)")
                 return "\n".join(lines)
@@ -1044,6 +1103,12 @@ def _tool_bridge_ready() -> bool:
     )
 
 
+def _truncate_for_telegram(text: str, limit: int = 3800) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n[truncated]"
+
+
 async def generate_agentic_reply(
     payload: dict,
     user_id: Optional[int],
@@ -1143,6 +1208,9 @@ async def generate_agentic_reply(
         critique = _sanitize_internal_blob(critique or "")
         if not critique:
             return None
+        lines = [line.strip() for line in critique.splitlines() if line.strip()]
+        critique = "\n".join(lines[:2])
+        critique = critique[:500]
         return critique
 
     if tool_access:
@@ -2856,6 +2924,9 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
 
         RECENT_DIALOGUE (latest to oldest):
         {recent_dialogue}
+
+        RECENT_TOOL_OUTPUTS:
+        {format_recent_tool_outputs(chat_id, thread_id)}
 
         THREAD_CONTEXT (recent here):
         {thread_ctx or '(none)'}
@@ -4657,6 +4728,36 @@ async def handle_real_tool_execution(
         )
 
         # Tool was executed (result will be shown by UI)
+        try:
+            formatted_output = result.formatted_output or (
+                json.dumps(result.output, ensure_ascii=False)
+                if isinstance(result.output, (dict, list))
+                else str(result.output) if result.output is not None else result.error or "(no output)"
+            )
+        except Exception:
+            formatted_output = str(result.output) if result.output is not None else result.error or "(no output)"
+
+        raw_output = formatted_output
+        if isinstance(result.output, (dict, list)):
+            try:
+                raw_output = json.dumps(result.output, ensure_ascii=False)
+            except Exception:
+                raw_output = formatted_output
+        chat_id = getattr(chat, "id", 0)
+        thread_id = getattr(update.effective_message, "message_thread_id", None) or 0
+        log_chain_agent_reply(
+            chat_id,
+            thread_id,
+            formatted_output,
+            tool_entries=[
+                {
+                    "tool": decision.tool_name or "tool",
+                    "state": "completed" if result.success else "failed",
+                    "result_preview": formatted_output[:200],
+                    "result_full": raw_output[:2000],
+                }
+            ],
+        )
         return True
 
     except Exception as e:
@@ -4779,7 +4880,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         state_obj = getattr(run, "state", None)
                         state_val = getattr(state_obj, "value", state_obj)
                         result_obj = getattr(run, "result", None)
-                        preview_txt = "(None)" if result_obj is None else str(result_obj)
+                        if isinstance(result_obj, (dict, list)):
+                            try:
+                                raw_text = json.dumps(result_obj, ensure_ascii=False)
+                            except Exception:
+                                raw_text = str(result_obj)
+                        else:
+                            raw_text = str(result_obj)
+                        raw_text = raw_text[:2000] if raw_text else ""
+                        preview_txt = raw_text or "(None)"
                         if getattr(run, "tool_name", "") == "plan_complex_task":
                             plan_tool_seen = True
                             digest = _summarize_plan_result(result_obj)
@@ -4791,6 +4900,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 "tool": getattr(run, "tool_name", ""),
                                 "state": state_val,
                                 "result_preview": preview_txt[:200],
+                                "result_full": raw_text,
                             }
                         )
                 if (not plan_digests and not plan_tool_seen and is_admin_user
@@ -4814,11 +4924,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             else:
                                 preview_value = textwrap.shorten(str(auto_plan_result), width=200, placeholder="…")
                                 plan_tool_seen = True
+                            raw_plan_text = (
+                                json.dumps(auto_plan_result, ensure_ascii=False)[:2000]
+                                if isinstance(auto_plan_result, (dict, list))
+                                else str(auto_plan_result)[:2000]
+                            )
                             tool_summary.append(
                                 {
                                     "tool": "plan_complex_task",
                                     "state": "auto",
                                     "result_preview": preview_value,
+                                    "result_full": raw_plan_text,
                                 }
                             )
                     except Exception as exc:
@@ -4853,7 +4969,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if is_admin_user:
                     button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
                 reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
-                reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
+                try:
+                    reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
+                except BadRequest as exc:
+                    truncated = _truncate_for_telegram(resp)
+                    try:
+                        reply_msg = await m.reply_text(truncated, reply_markup=reply_markup)
+                    except Exception:
+                        reply_msg = await m.reply_text("⚠️ Reply truncated due to length limits.", reply_markup=reply_markup)
+                except Exception:
+                    reply_msg = await m.reply_text("⚠️ Unable to send full reply; see chain log for details.", reply_markup=reply_markup)
                 if debug_enabled and reply_msg:
                     DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
                         "response": resp,
@@ -4967,7 +5092,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     state_obj = getattr(run, "state", None)
                     state_val = getattr(state_obj, "value", state_obj)
                     result_obj = getattr(run, "result", None)
-                    preview_txt = "(None)" if result_obj is None else str(result_obj)
+                    if isinstance(result_obj, (dict, list)):
+                        try:
+                            raw_text = json.dumps(result_obj, ensure_ascii=False)
+                        except Exception:
+                            raw_text = str(result_obj)
+                    else:
+                        raw_text = str(result_obj)
+                    raw_text = raw_text[:2000] if raw_text else ""
+                    preview_txt = raw_text or "(None)"
                     if getattr(run, "tool_name", "") == "plan_complex_task":
                         digest = _summarize_plan_result(result_obj)
                         if digest:
@@ -4978,6 +5111,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "tool": getattr(run, "tool_name", ""),
                             "state": state_val,
                             "result_preview": preview_txt[:200],
+                            "result_full": raw_text,
                         }
                     )
             if tool_summary:
@@ -4985,6 +5119,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tool_summary_entries = tool_summary
             if plan_digests:
                 plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
+                if len(plan_section) > 1000:
+                    plan_section = _truncate_for_telegram(plan_section, 1000)
                 resp = (resp or "").rstrip()
                 resp = f"{resp}\n\n{plan_section}" if resp else plan_section
             critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
@@ -5011,8 +5147,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_msg = None
             try:
                 reply_msg = await m.reply_text(resp, reply_markup=reply_markup)
+            except BadRequest as exc:
+                truncated = _truncate_for_telegram(resp)
+                try:
+                    reply_msg = await m.reply_text(truncated, reply_markup=reply_markup)
+                except Exception:
+                    reply_msg = await context.bot.send_message(chat_id=chat.id, text=_truncate_for_telegram(resp, 2000), reply_markup=reply_markup)
             except Exception:
-                reply_msg = await context.bot.send_message(chat_id=chat.id, text=resp, reply_markup=reply_markup)
+                reply_msg = await context.bot.send_message(chat_id=chat.id, text=_truncate_for_telegram(resp, 2000), reply_markup=reply_markup)
             if debug_enabled and reply_msg:
                 DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
                     "response": resp,
