@@ -538,6 +538,7 @@ MAX_CONTEXT_GROUPS = int(os.getenv("MAX_CONTEXT_GROUPS") or 30)
 
 DEBUG_FLAGS: Dict[int, bool] = defaultdict(bool)
 DEBUG_CONTEXTS: Dict[tuple[int, int], Dict[str, str]] = {}
+SELF_CHECK_CONTEXTS: Dict[tuple[int, int], str] = {}
 
 CHAIN_LOG_MAX_LEN = 16
 CHAIN_LOGS: Dict[tuple[int, int], deque[dict]] = {}
@@ -1940,6 +1941,36 @@ async def chain_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         await query.answer("Unable to send chain summary.", show_alert=True)
+        return
+    await query.answer()
+
+
+async def selfcheck_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    user = query.from_user
+    if user and user.id not in ADMIN_WHITELIST:
+        await query.answer("Admins only.", show_alert=True)
+        return
+    chat = query.message.chat
+    if not chat:
+        await query.answer()
+        return
+    key = (chat.id, query.message.message_id)
+    payload = SELF_CHECK_CONTEXTS.get(key)
+    if not payload:
+        await query.answer("Self-check unavailable.", show_alert=True)
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=f"🧠 Self-check:\n{payload}",
+            reply_to_message_id=query.message.message_id,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await query.answer("Unable to share self-check.", show_alert=True)
         return
     await query.answer()
 
@@ -5078,8 +5109,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     resp = (resp or "").rstrip()
                     resp = f"{resp}\n\n{plan_section}" if resp else plan_section
                 critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
-                if critique:
-                    resp = f"{resp}\n\n🧠 Self-check:\n{critique}"
+                self_check_text = (critique or "").strip()
                 debug_enabled = DEBUG_FLAGS.get(chat.id, False)
                 debug_context_text = ""
                 button_row: List[InlineKeyboardButton] = []
@@ -5097,6 +5127,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     button_row.append(InlineKeyboardButton("Show context", callback_data="debug:show"))
                 if is_admin_user:
                     button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
+                    if self_check_text:
+                        button_row.append(InlineKeyboardButton("Self check", callback_data="selfcheck:show"))
                 reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
                 reply_msg = await _safe_send_reply(
                     context,
@@ -5110,6 +5142,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "response": reply_msg.text,
                         "context": debug_context_text,
                     }
+                if self_check_text and reply_msg:
+                    SELF_CHECK_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = self_check_text
                 sent_text = reply_msg.text if reply_msg else _truncate_for_telegram(resp)
                 reply_message_id = reply_msg.message_id if reply_msg else None
                 log_chain_agent_reply(chat.id, thread_id, sent_text, tool_entries=tool_summary_entries, message_id=reply_message_id)
@@ -5250,8 +5284,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resp = (resp or "").rstrip()
                 resp = f"{resp}\n\n{plan_section}" if resp else plan_section
             critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
-            if critique:
-                resp = f"{resp}\n\n🧠 Self-check:\n{critique}"
+            self_check_text = (critique or "").strip()
             debug_enabled = DEBUG_FLAGS.get(chat.id, False)
             debug_context_text = ""
             button_row: List[InlineKeyboardButton] = []
@@ -5269,6 +5302,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 button_row.append(InlineKeyboardButton("Show context", callback_data="debug:show"))
             if is_admin_user:
                 button_row.append(InlineKeyboardButton("View chain", callback_data="chain:show"))
+                if self_check_text:
+                    button_row.append(InlineKeyboardButton("Self check", callback_data="selfcheck:show"))
             reply_markup = InlineKeyboardMarkup([button_row]) if button_row else None
             reply_msg = await _safe_send_reply(
                 context,
@@ -5282,6 +5317,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "response": reply_msg.text,
                     "context": debug_context_text,
                 }
+            if self_check_text and reply_msg:
+                SELF_CHECK_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = self_check_text
             sent_text = reply_msg.text if reply_msg else _truncate_for_telegram(resp)
             reply_message_id = reply_msg.message_id if reply_msg else None
             log_chain_agent_reply(chat.id, thread_id, sent_text, tool_entries=tool_summary_entries, message_id=reply_message_id)
@@ -5637,6 +5674,7 @@ def main():
     app.add_handler(CallbackQueryHandler(adminreq_cb, pattern=r"^adminreq:(approve|deny):\d+$"))
     app.add_handler(CallbackQueryHandler(debug_toggle_cb, pattern=r"^debug:(show|hide)$"))
     app.add_handler(CallbackQueryHandler(chain_cb, pattern=r"^chain:show$"))
+    app.add_handler(CallbackQueryHandler(selfcheck_cb, pattern=r"^selfcheck:show$"))
 
     # Tool execution callbacks (confirmation and rating)
     if REAL_TOOL_EXECUTION_AVAILABLE:
