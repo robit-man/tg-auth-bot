@@ -1052,6 +1052,44 @@ async def generate_agentic_reply(
     executions: List[Any] = []
     tool_access = _tool_bridge_ready()
 
+    def _summarize_plan_result(data: Any) -> Optional[str]:
+        if not isinstance(data, dict):
+            return None
+
+        success = bool(data.get("success", True))
+        summary = data.get("summary", {})
+        plan_obj = data.get("plan") or {}
+        steps = plan_obj.get("steps") or []
+        objective = data.get("objective") or plan_obj.get("objective") or ""
+
+        if isinstance(summary, dict):
+            total_steps = summary.get("total_steps")
+            successes = summary.get("successes")
+            failures = summary.get("failures") or []
+        else:
+            total_steps = successes = None
+            failures = []
+
+        status_icon = "✅" if success else "⚠️"
+        parts = [f"{status_icon} plan {'completed' if success else 'needs attention'}"]
+        if objective:
+            parts.append(f"objective: {textwrap.shorten(str(objective), width=80, placeholder='…')}")
+        if total_steps is not None and successes is not None:
+            parts.append(f"steps {successes}/{total_steps}")
+        if failures:
+            fail_labels = ", ".join(str(f) for f in failures[:3])
+            parts.append(f"failed: {fail_labels}")
+        step_titles = [
+            textwrap.shorten(str(step.get('title') or step.get('id') or ""), width=60, placeholder="…")
+            for step in steps[:3] if isinstance(step, dict)
+        ]
+        if step_titles:
+            parts.append("key steps: " + "; ".join(step_titles))
+        deliverables = data.get("deliverables")
+        if deliverables:
+            parts.append(f"deliverables: {textwrap.shorten(str(deliverables), width=80, placeholder='…')}")
+        return " | ".join(filter(None, parts))
+
     if tool_access:
         try:
             enhanced_payload = EnhancedPromptBuilder.inject_tool_context(
@@ -2746,6 +2784,14 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
            - Tool results will be injected into context automatically
            - Synthesize a natural language response incorporating the results
            - Cite sources when appropriate (URLs, page numbers, etc.)
+
+        PLANNER QUICKSTART (admin only):
+           Tools.plan_complex_task(
+               objective="Rewrite onboarding playbook",
+               constraints="Keep under 4 hours of work",
+               deliverables="Summary memo, TODO list"
+           )
+           Review the planner's summary and artifacts before replying; weave key insights into your answer.
 
         GRAPH_CONTEXT (server={chat_id}, channel={thread_id or 0}):
           Top entities:
@@ -4669,17 +4715,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
             tool_summary_entries: List[dict] = []
+            plan_digests: List[str] = []
+            plan_tool_seen = False
             if resp:
+                tool_summary = []
                 if tool_runs:
-                    tool_summary = []
                     for run in tool_runs:
                         state_obj = getattr(run, "state", None)
                         state_val = getattr(state_obj, "value", state_obj)
-                        result_preview = getattr(run, "result", None)
-                        if result_preview is None:
+                        result_obj = getattr(run, "result", None)
+                        if getattr(run, "tool_name", "") == "plan_complex_task":
+                            plan_tool_seen = True
+                            digest = _summarize_plan_result(result_obj)
+                            if digest:
+                                plan_digests.append(digest)
+                        if result_obj is None:
                             preview_txt = "(None)"
                         else:
-                            preview_txt = str(result_preview)
+                            preview_txt = str(result_obj)
                         tool_summary.append(
                             {
                                 "tool": getattr(run, "tool_name", ""),
@@ -4687,8 +4740,40 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 "result_preview": preview_txt[:200],
                             }
                         )
+                if (not plan_digests and not plan_tool_seen and is_admin_user
+                        and complexity_meta.get("complexity") == "high"
+                        and len(text) >= 80):
+                    session_label = f"tg-plan-{chat.id}-{m.message_id}"
+                    try:
+                        auto_plan_result = await asyncio.to_thread(
+                            Tools.plan_complex_task,
+                            text,
+                            constraints=None,
+                            deliverables=None,
+                            session_id=session_label,
+                        )
+                        if isinstance(auto_plan_result, dict):
+                            digest = _summarize_plan_result(auto_plan_result)
+                            if digest:
+                                plan_digests.append(digest)
+                            tool_summary.append(
+                                {
+                                    "tool": "plan_complex_task",
+                                    "state": "auto",
+                                    "result_preview": textwrap.shorten(str(auto_plan_result), width=200, placeholder="…"),
+                                }
+                            )
+                    except Exception as exc:
+                        print(f"[planner] Auto plan failed: {exc}")
+
+                if tool_summary:
                     complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
-                    tool_summary_entries = tool_summary
+                tool_summary_entries = tool_summary
+
+                if plan_digests:
+                    plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
+                    resp = (resp or "").rstrip()
+                    resp = f"{resp}\n\n{plan_section}" if resp else plan_section
                 debug_enabled = DEBUG_FLAGS.get(chat.id, False)
                 debug_context_text = ""
                 button_row: List[InlineKeyboardButton] = []
@@ -4813,17 +4898,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
         tool_summary_entries: List[dict] = []
+        plan_digests: List[str] = []
         if resp:
+            tool_summary = []
             if tool_runs:
-                tool_summary = []
                 for run in tool_runs:
                     state_obj = getattr(run, "state", None)
                     state_val = getattr(state_obj, "value", state_obj)
-                    result_preview = getattr(run, "result", None)
-                    if result_preview is None:
+                    result_obj = getattr(run, "result", None)
+                    if getattr(run, "tool_name", "") == "plan_complex_task":
+                        digest = _summarize_plan_result(result_obj)
+                        if digest:
+                            plan_digests.append(digest)
+                    if result_obj is None:
                         preview_txt = "(None)"
                     else:
-                        preview_txt = str(result_preview)
+                        preview_txt = str(result_obj)
                     tool_summary.append(
                         {
                             "tool": getattr(run, "tool_name", ""),
@@ -4831,8 +4921,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "result_preview": preview_txt[:200],
                         }
                     )
+            if tool_summary:
                 complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
-                tool_summary_entries = tool_summary
+            tool_summary_entries = tool_summary
+            if plan_digests:
+                plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
+                resp = (resp or "").rstrip()
+                resp = f"{resp}\n\n{plan_section}" if resp else plan_section
             debug_enabled = DEBUG_FLAGS.get(chat.id, False)
             debug_context_text = ""
             button_row: List[InlineKeyboardButton] = []
