@@ -258,9 +258,10 @@ class IntelligentToolRouter:
         planning_triggers = [
             "plan", "multi-step", "multi step", "roadmap", "strategy",
             "workflow", "sequence", "pipeline", "project plan", "long task",
-            "break down", "step by step"
+            "break down", "step by step", "architecture", "design", "blueprint",
+            "script", "build", "implement"
         ]
-        if any(kw in msg_lower for kw in planning_triggers) or len(user_message) > 220:
+        if any(kw in msg_lower for kw in planning_triggers) or len(user_message) > 160:
             scores[RouteType.TOOL_EXECUTION] += 2.0
 
         # Default: direct answer gets small boost if nothing else matches
@@ -400,9 +401,10 @@ Return JSON with scores for each route (0.0 to 1.0):
             if "plan_complex_task" in self.available_tools:
                 plan_keywords = [
                     "plan", "roadmap", "strategy", "multi-step", "multi step",
-                    "workflow", "project plan", "long project", "break down", "step by step"
+                    "workflow", "project plan", "long project", "break down", "step by step",
+                    "architecture", "design", "script", "build", "implement"
                 ]
-                if any(kw in msg_lower for kw in plan_keywords) or len(user_message) > 220:
+                if any(kw in msg_lower for kw in plan_keywords) or len(user_message) > 160:
                     tools_needed.append("plan_complex_task")
             # fall back to read/write heuristics to allow combined execution
             if "read_file" in self.available_tools and "read" in msg_lower:

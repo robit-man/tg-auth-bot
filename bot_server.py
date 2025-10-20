@@ -1098,6 +1098,53 @@ async def generate_agentic_reply(
             parts.append(f"deliverables: {textwrap.shorten(str(deliverables), width=80, placeholder='…')}")
         return " | ".join(filter(None, parts))
 
+    async def _evaluate_reply(
+        user_text: str,
+        draft_reply: str,
+        tool_entries: List[dict],
+        plan_notes: List[str],
+    ) -> Optional[str]:
+        if not ai_available():
+            return None
+
+        tool_summaries = []
+        for entry in tool_entries[:4]:
+            name = entry.get("tool") or "tool"
+            preview = entry.get("result_preview") or ""
+            tool_summaries.append(f"{name}: {preview}")
+
+        planner_section = "\n".join(plan_notes[:3]) if plan_notes else "(none)"
+        tool_section = "\n".join(tool_summaries) if tool_summaries else "(none)"
+
+        prompt = textwrap.dedent(f"""
+            You are Gatekeeper Bot's internal QA critic. Review the draft reply.
+            Provide up to two short bullet points covering potential issues or improvements.
+            Mention if tool outputs or planner notes were not fully addressed and suggest fixes.
+            If everything looks good, respond with "- Looks good." Keep each bullet under 120 characters.
+
+            USER MESSAGE:
+            {user_text}
+
+            DRAFT REPLY:
+            {draft_reply}
+
+            TOOL OUTPUTS:
+            {tool_section}
+
+            PLANNER NOTES:
+            {planner_section}
+        """).strip()
+
+        critique = await ai_generate_async({
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        })
+        critique = _sanitize_internal_blob(critique or "")
+        if not critique:
+            return None
+        return critique
+
     if tool_access:
         try:
             enhanced_payload = EnhancedPromptBuilder.inject_tool_context(
@@ -4785,6 +4832,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
                     resp = (resp or "").rstrip()
                     resp = f"{resp}\n\n{plan_section}" if resp else plan_section
+                critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
+                if critique:
+                    resp = f"{resp}\n\n🧠 Self-check:\n{critique}"
                 debug_enabled = DEBUG_FLAGS.get(chat.id, False)
                 debug_context_text = ""
                 button_row: List[InlineKeyboardButton] = []
@@ -4937,6 +4987,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
                 resp = (resp or "").rstrip()
                 resp = f"{resp}\n\n{plan_section}" if resp else plan_section
+            critique = await _evaluate_reply(text, resp, tool_summary_entries, plan_digests)
+            if critique:
+                resp = f"{resp}\n\n🧠 Self-check:\n{critique}"
             debug_enabled = DEBUG_FLAGS.get(chat.id, False)
             debug_context_text = ""
             button_row: List[InlineKeyboardButton] = []
