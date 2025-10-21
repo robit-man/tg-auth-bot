@@ -1858,6 +1858,73 @@ def fetch_thread_context(chat_id: int, thread_id: int, limit: int = 24) -> str:
         if lines:
             return "\n".join(lines[-limit:])
 
+def _lookup_user_display_name(user_id: int) -> str:
+    if not user_id:
+        return "user"
+    with closing(db()) as con:
+        row = con.execute(
+            """SELECT first_name,last_name,username FROM messages
+               WHERE user_id=? ORDER BY date DESC LIMIT 1""",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return f"user#{user_id}"
+    first, last, username = row
+    name = " ".join(p for p in (first or "", last or "") if p).strip()
+    if not name and username:
+        name = f"@{username}"
+    return name or f"user#{user_id}"
+
+
+def _collect_user_emotion_profiles(limit: int = 20) -> str:
+    with closing(db()) as con:
+        rows = con.execute(
+            """SELECT user_id, content, metadata, created_ts
+               FROM memory_entries
+               WHERE category='emotion_profile' AND user_id IS NOT NULL AND user_id != 0
+               ORDER BY created_ts DESC"""
+        ).fetchall()
+    profiles: Dict[int, Dict[str, Any]] = {}
+    for user_id, content, metadata_json, created_ts in rows:
+        if not user_id or user_id in profiles:
+            continue
+        try:
+            meta = json.loads(metadata_json or "{}")
+        except Exception:
+            meta = {}
+        profiles[user_id] = {
+            "content": (content or "").strip(),
+            "metadata": meta,
+            "created_ts": created_ts,
+        }
+        if len(profiles) >= limit:
+            break
+    if not profiles:
+        return "(none)"
+    lines: List[str] = []
+    for user_id, info in profiles.items():
+        meta = info.get("metadata") or {}
+        emotion = (meta.get("emotion") or "").strip()
+        intent = (meta.get("intent") or "").strip()
+        tone = (meta.get("tone") or "").strip()
+        confidence = meta.get("confidence")
+        ts = info.get("created_ts")
+        stamp = datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else ""
+        tags = meta.get("tags") or []
+        label = _lookup_user_display_name(user_id)
+        parts = [
+            f"emotion={emotion}" if emotion else "",
+            f"intent={intent}" if intent else "",
+            f"tone={tone}" if tone else "",
+            f"confidence={confidence:.2f}" if isinstance(confidence, (int, float)) else "",
+        ]
+        profile = "; ".join(p for p in parts if p)
+        tag_txt = f" tags={','.join(tags[:3])}" if tags else ""
+        if not profile:
+            profile = info.get("content") or "(no summary)"
+        lines.append(f"{label} [{stamp}]: {profile}{tag_txt}")
+    return "\n".join(lines)
+
     # Fallback: read from persisted messages (older behaviour) if no chain data.
     thread_key = int(thread_id or 0)
     with closing(db()) as con:
@@ -3369,8 +3436,8 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
     chron_global = fetch_context_messages(MAX_CONTEXT_MESSAGES, MAX_CONTEXT_CHARS)
 
     sys_prompt = SYSTEM_PROMPT or (
-        "You are Gatekeeper Bot. Be succinct and accurate. Prefer channel-local context, then server, then global. "
-        "Use the GRAPH and similarities. Show only commands the user can use; don't mention /setadmin to non-admins."
+        "You are a concise, context-aware assistant. Prioritise the active thread, stay empathetic to user wellbeing signals, "
+        "and blend in stored knowledge only when it reinforces the current goal. Offer commands only when relevant to the user."
     )
     graph_here = "\n".join(kg_snapshot.get("rels_here", [])[:10]) or "(none)"
     ents_here = "\n".join(kg_snapshot.get("ents_here", [])[:10]) or "(none)"
@@ -4725,14 +4792,17 @@ async def maybe_update_system_prompt_from_reflection(
         sleep_summary += f"\nDiscoveries: {discoveries_line}"
     dream_directive = "Normal consolidation; maintain balanced tone."
     if sleep_state == SleepState.DEEP_SLEEP:
-        dream_directive = "Deep-sleep phase: emphasize analytical rigor, reinforce safety guardrails, and integrate structural insights."
+        dream_directive = "Deep-sleep phase: emphasize analytical rigor and integrate structural insights."
     elif sleep_state == SleepState.REM_SLEEP:
         dream_directive = "REM dream phase: let dream insights steer tone boldly toward creative but safe experimentation."
     elif sleep_state == SleepState.WAKING:
         dream_directive = "Waking integration: translate overnight discoveries into actionable guidance and refreshed priorities."
+    wellbeing_summary = _collect_user_emotion_profiles()
+
     prompt = textwrap.dedent(f"""
-        Use the latest global summaries and self-reflections to refine Gatekeeper Bot's internal system prompt.
-        Keep it under 600 words, emphasise tone, decision rules, memory usage, and safety guardrails.
+        Use the latest global summaries, self-reflections, and wellbeing profiles to refine the assistant's internal system prompt.
+        Keep it under 600 words and focus on tone guidance, decision rules, memory usage, and user wellbeing insights.
+        Avoid boilerplate safety disclaimers or references to prior brand names.
         Return plain text (no JSON).
 
         Sleep context:
@@ -4740,6 +4810,9 @@ async def maybe_update_system_prompt_from_reflection(
 
         Dream insights (steer strongly — {dream_directive}):
         {('\\n'.join(dream_lines)) if dream_lines else '(none)'}
+
+        USER WELLBEING SNAPSHOT:
+        {wellbeing_summary}
 
         GLOBAL SUMMARIES:
         {('\\n'.join(summaries)) if summaries else '(none)'}
