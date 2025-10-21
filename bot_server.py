@@ -541,7 +541,9 @@ DEBUG_CONTEXTS: Dict[tuple[int, int], Dict[str, str]] = {}
 SELF_CHECK_CONTEXTS: Dict[tuple[int, int], str] = {}
 
 CHAIN_LOG_MAX_LEN = 16
+CHAIN_HISTORY_STORE_LIMIT = max(CHAIN_LOG_MAX_LEN * 6, 64)
 CHAIN_LOGS: Dict[tuple[int, int], deque[dict]] = {}
+CHAIN_LOGS_LOADED: set[tuple[int, int]] = set()
 
 
 def _chain_key(chat_id: int, thread_id: int | None) -> tuple[int, int]:
@@ -554,7 +556,86 @@ def _get_chain_log(chat_id: int, thread_id: int | None) -> deque[dict]:
     if dq is None:
         dq = deque(maxlen=CHAIN_LOG_MAX_LEN)
         CHAIN_LOGS[key] = dq
+        if key not in CHAIN_LOGS_LOADED:
+            history = _load_chain_history(chat_id, thread_id, CHAIN_LOG_MAX_LEN)
+            if history:
+                dq.extend(history)
+            CHAIN_LOGS_LOADED.add(key)
     return dq
+
+
+def _load_chain_history(chat_id: int, thread_id: int | None, limit: int) -> List[dict]:
+    thread_key = int(thread_id or 0)
+    try:
+        with closing(db()) as con:
+            rows = con.execute(
+                """
+                    SELECT role, content, user_id, message_id, tools_preview, tools_raw, ts
+                    FROM conversation_log
+                    WHERE chat_id=? AND thread_id=?
+                    ORDER BY id DESC
+                    LIMIT ?
+                """,
+                (int(chat_id), thread_key, int(limit)),
+            ).fetchall()
+    except Exception as exc:
+        print(f"[chain] Failed to load history for {chat_id}/{thread_key}: {exc}")
+        return []
+
+    entries: List[dict] = []
+    for role, content, user_id, message_id, tools_preview, tools_raw, ts in reversed(rows):
+        entry: dict[str, Any] = {"ts": ts}
+        preview_list: List[str] = []
+        raw_list: List[Dict[str, Any]] = []
+        if tools_preview:
+            try:
+                parsed = json.loads(tools_preview)
+                if isinstance(parsed, list):
+                    preview_list = [str(item) for item in parsed]
+            except Exception:
+                preview_list = []
+        if tools_raw:
+            try:
+                parsed_raw = json.loads(tools_raw)
+                if isinstance(parsed_raw, list):
+                    raw_list = [item for item in parsed_raw if isinstance(item, dict)]
+            except Exception:
+                raw_list = []
+        if role == "user":
+            text = content or ""
+            entry.update(
+                {
+                    "user": _shorten_for_chain(text),
+                    "user_raw": text,
+                    "user_id": user_id,
+                    "user_message_id": message_id,
+                }
+            )
+        elif role == "tool":
+            tool_name = preview_list[0] if preview_list else "tool"
+            entry.update(
+                {
+                    "tool_event": tool_name,
+                    "tool_output": content or "",
+                    "tool_metadata": raw_list[0] if raw_list else {},
+                    "tool_message_id": message_id,
+                }
+            )
+        else:
+            text = content or ""
+            entry.update(
+                {
+                    "assistant": _shorten_for_chain(text),
+                    "assistant_raw": text,
+                    "assistant_message_id": message_id,
+                }
+            )
+            if preview_list:
+                entry["tools"] = preview_list
+            if raw_list:
+                entry["tools_raw"] = raw_list
+        entries.append(entry)
+    return entries
 
 
 def _shorten_for_chain(text: str, limit: int = 320) -> str:
@@ -594,6 +675,130 @@ def _condense_tool_entries(tool_entries: Optional[Iterable[Any]]) -> List[str]:
     return lines
 
 
+def _queue_chain_persist(
+    role: str,
+    chat_id: int,
+    thread_id: int | None,
+    content: str,
+    *,
+    user_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    tools: Optional[Iterable[str]] = None,
+    tools_raw: Optional[List[Dict[str, str]]] = None,
+    ts: Optional[float] = None,
+) -> None:
+    thread_key = int(thread_id or 0)
+    text = (content or "")
+    if not text and role == "user":
+        return
+    ts_val = float(ts if ts is not None else time.time())
+    preview_list = [str(item) for item in tools] if tools else []
+    tools_json = json.dumps(preview_list, ensure_ascii=False) if preview_list else None
+    tools_raw_json = json.dumps(tools_raw, ensure_ascii=False) if tools_raw else None
+    truncated_text = text[:4000]
+
+    def _write(con: sqlite3.Connection):
+        con.execute(
+            """
+                INSERT INTO conversation_log(chat_id, thread_id, role, content, user_id, message_id, tools_preview, tools_raw, ts)
+                VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(chat_id),
+                thread_key,
+                role,
+                truncated_text,
+                user_id,
+                message_id,
+                tools_json,
+                tools_raw_json,
+                ts_val,
+            ),
+        )
+        if CHAIN_HISTORY_STORE_LIMIT:
+            extra_rows = con.execute(
+                """
+                    SELECT id FROM conversation_log
+                    WHERE chat_id=? AND thread_id=?
+                    ORDER BY id DESC
+                    LIMIT -1 OFFSET ?
+                """,
+                (int(chat_id), thread_key, int(CHAIN_HISTORY_STORE_LIMIT)),
+            ).fetchall()
+            if extra_rows:
+                ids = [row[0] for row in extra_rows]
+                placeholders = ",".join("?" for _ in ids)
+                con.execute(f"DELETE FROM conversation_log WHERE id IN ({placeholders})", ids)
+        con.commit()
+
+    async def _persist_async():
+        try:
+            await DBW.run(DB_PATH, _write)  # type: ignore[union-attr]
+        except Exception as exc:
+            print(f"[chain] Failed to persist entry for {chat_id}/{thread_key}: {exc}")
+
+    if DBW is None:
+        try:
+            with closing(db()) as con:
+                _write(con)
+        except Exception as exc:
+            print(f"[chain] Direct persist failed for {chat_id}/{thread_key}: {exc}")
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_persist_async())
+    except RuntimeError:
+        try:
+            with closing(db()) as con:
+                _write(con)
+        except Exception as exc:
+            print(f"[chain] Fallback persist failed for {chat_id}/{thread_key}: {exc}")
+
+
+def log_chain_tool_event(
+    chat_id: int,
+    thread_id: int | None,
+    tool_name: str,
+    output_text: str,
+    *,
+    state: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    message_id: Optional[int] = None,
+) -> None:
+    text = (output_text or "").strip()
+    if not text:
+        return
+    meta = metadata.copy() if isinstance(metadata, dict) else {}
+    if state:
+        meta.setdefault("state", state)
+    entry = {
+        "tool_event": tool_name or "tool",
+        "tool_output": text,
+        "tool_metadata": meta,
+        "tool_message_id": message_id,
+        "ts": time.time(),
+    }
+    raw_record = {"tool": tool_name, "output": text}
+    if meta:
+        raw_record["metadata"] = meta
+    entry["tools_raw"] = [raw_record]
+    entry["tools"] = [tool_name]
+    dq = _get_chain_log(chat_id, thread_id)
+    dq.append(entry)
+    _queue_chain_persist(
+        "tool",
+        chat_id,
+        thread_id,
+        text,
+        user_id=None,
+        message_id=message_id,
+        tools=[tool_name],
+        tools_raw=[raw_record],
+        ts=entry["ts"],
+    )
+
+
 def log_chain_user_message(chat_id: int, thread_id: int | None, text: str, *, user_id: Optional[int] = None, message_id: Optional[int] = None) -> None:
     if not text:
         return
@@ -606,6 +811,15 @@ def log_chain_user_message(chat_id: int, thread_id: int | None, text: str, *, us
     }
     dq = _get_chain_log(chat_id, thread_id)
     dq.append(entry)
+    _queue_chain_persist(
+        "user",
+        chat_id,
+        thread_id,
+        text,
+        user_id=user_id,
+        message_id=message_id,
+        ts=entry["ts"],
+    )
 
 
 def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, tool_entries: Optional[Iterable[Any]] = None, message_id: Optional[int] = None, raw_tool_entries: Optional[List[Dict[str, str]]] = None) -> None:
@@ -639,6 +853,16 @@ def log_chain_agent_reply(chat_id: int, thread_id: int | None, text: str, *, too
         dq[-1].update(response_data)
     else:
         dq.append(response_data)
+    _queue_chain_persist(
+        "assistant",
+        chat_id,
+        thread_id,
+        text,
+        message_id=message_id,
+        tools=response_data.get("tools"),
+        tools_raw=response_data.get("tools_raw"),
+        ts=response_data["ts"],
+    )
 
 
 def build_chain_summary(chat_id: int, thread_id: int | None, limit: int = 10) -> str:
@@ -674,21 +898,55 @@ def format_recent_tool_outputs(chat_id: int, thread_id: int | None, *, limit: in
     lines: List[str] = []
     total = 0
     count = 0
+    seen: set[str] = set()
+    seen_outputs: set[str] = set()
     for entry in reversed(dq):
+        tool_event = entry.get("tool_event")
+        if tool_event:
+            output_text = entry.get("tool_output", "")
+            if output_text:
+                label = str(tool_event)
+                state = entry.get("tool_metadata", {}).get("state") if isinstance(entry.get("tool_metadata"), dict) else None
+                if state:
+                    label += f" ({state})"
+                line = f"{label}: {output_text}"
+                key = f"{label}::{output_text}"
+                if key in seen_outputs:
+                    continue
+                snippet = textwrap.shorten(line, width=360, placeholder=" …")
+                if snippet not in seen:
+                    if total + len(snippet) + 1 > max_chars:
+                        lines.append("… (truncated)")
+                        return "\n".join(lines)
+                    lines.append(snippet)
+                    seen.add(snippet)
+                    seen_outputs.add(key)
+                    total += len(snippet) + 1
+                    count += 1
+                    if count >= limit:
+                        return "\n".join(lines)
         raw_entries = entry.get("tools_raw") or []
         for raw in raw_entries:
             tool_name = raw.get("tool", "tool")
             raw_text = raw.get("output", "")
             if not raw_text:
                 continue
-            count += 1
-            line = f"{count}. {tool_name}: {raw_text}"
+            key = f"{tool_name}::{raw_text}"
+            if key in seen_outputs:
+                continue
+            next_count = count + 1
+            line = f"{next_count}. {tool_name}: {raw_text}"
             snippet = textwrap.shorten(line, width=360, placeholder=" …")
+            if snippet in seen:
+                continue
             if total + len(snippet) + 1 > max_chars:
                 lines.append("… (truncated)")
                 return "\n".join(lines)
             lines.append(snippet)
+            seen.add(snippet)
+            seen_outputs.add(key)
             total += len(snippet) + 1
+            count = next_count
             if count >= limit:
                 return "\n".join(lines)
 
@@ -708,11 +966,27 @@ def format_recent_dialogue(chat_id: int, thread_id: int | None, *, limit: int = 
         asst_raw = entry.get("assistant_raw") or entry.get("assistant") or ""
         user_line = f"{idx}. USER: {user_raw}"
         bot_line = f"{idx}. BOT: {asst_raw}" if asst_raw else ""
+        tool_event = entry.get("tool_event")
+        tool_line = ""
+        if tool_event:
+            label = str(tool_event)
+            state = entry.get("tool_metadata", {}).get("state") if isinstance(entry.get("tool_metadata"), dict) else None
+            if state:
+                label += f" ({state})"
+            tool_output = entry.get("tool_output", "") or entry.get("assistant_raw", "")
+            tool_line = f"{idx}. TOOL[{label}]: {tool_output}"
 
         for line in (user_line, bot_line):
             if not line:
                 continue
             snippet = textwrap.shorten(line, width=260, placeholder=" …")
+            if total + len(snippet) + 1 > max_chars:
+                lines.append("… (truncated)")
+                return "\n".join(lines)
+            lines.append(snippet)
+            total += len(snippet) + 1
+        if tool_line:
+            snippet = textwrap.shorten(tool_line, width=260, placeholder=" …")
             if total + len(snippet) + 1 > max_chars:
                 lines.append("… (truncated)")
                 return "\n".join(lines)
@@ -879,6 +1153,24 @@ def ensure_schema_on(con: sqlite3.Connection):
         style_notes TEXT,
         suggestions TEXT
       );
+    """)
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS conversation_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        thread_id INTEGER,
+        role TEXT,
+        content TEXT,
+        user_id INTEGER,
+        message_id INTEGER,
+        tools_preview TEXT,
+        tools_raw TEXT,
+        ts REAL
+      );
+    """)
+    con.execute("""
+      CREATE INDEX IF NOT EXISTS idx_conversation_chat_thread
+      ON conversation_log(chat_id, thread_id, id)
     """)
 
 def db():
@@ -1466,12 +1758,42 @@ async def kg_add_triples_for_message_async(row_id: int):
 # 8) Context/similarity (reads)
 # ──────────────────────────────────────────────────────────────
 def fetch_thread_context(chat_id: int, thread_id: int, limit: int = 24) -> str:
+    dq = _get_chain_log(chat_id, thread_id)
+    if dq:
+        lines: List[str] = []
+        for entry in list(dq)[-limit * 2 :]:
+            ts_val = float(entry.get("ts") or time.time())
+            ts_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_val))
+            if "user_raw" in entry or "user" in entry:
+                text = entry.get("user_raw") or entry.get("user") or ""
+                marker = f"USER#{entry.get('user_id')}" if entry.get("user_id") else "USER"
+                if text:
+                    lines.append(f"[{ts_txt}] {marker}: {text}")
+            elif "assistant_raw" in entry or "assistant" in entry:
+                text = entry.get("assistant_raw") or entry.get("assistant") or ""
+                if text:
+                    lines.append(f"[{ts_txt}] BOT: {text}")
+                for tool_entry in entry.get("tools_raw") or []:
+                    tool_name = tool_entry.get("tool") or "tool"
+                    preview = tool_entry.get("output") or ""
+                    if preview:
+                        lines.append(f"[{ts_txt}] TOOL[{tool_name}]: {preview}")
+            elif entry.get("tool_event"):
+                tool_name = entry.get("tool_event") or "tool"
+                output = entry.get("tool_output") or ""
+                if output:
+                    lines.append(f"[{ts_txt}] TOOL[{tool_name}]: {output}")
+        if lines:
+            return "\n".join(lines[-limit:])
+
+    # Fallback: read from persisted messages (older behaviour) if no chain data.
+    thread_key = int(thread_id or 0)
     with closing(db()) as con:
         rows = con.execute(
             """SELECT date, user_id, username, first_name, last_name, text
                FROM messages WHERE chat_id=? AND (thread_id=? OR ?=0)
                ORDER BY id DESC LIMIT ?""",
-            (chat_id, thread_id or 0, thread_id or 0, limit)
+            (chat_id, thread_key, thread_key, limit)
         ).fetchall()
     lines = []
     for (ts, uid, uname, first, last, txt) in reversed(rows):
@@ -2948,7 +3270,15 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
     )
     graph_here = "\n".join(kg_snapshot.get("rels_here", [])[:10]) or "(none)"
     ents_here = "\n".join(kg_snapshot.get("ents_here", [])[:10]) or "(none)"
-    recent_dialogue = format_recent_dialogue(chat_id, thread_id, limit=4, max_chars=800)
+    recent_dialogue = _truncate_text(
+        format_recent_dialogue(chat_id, thread_id, limit=10, max_chars=1600),
+        1600,
+    )
+    recent_tools_block = _truncate_text(
+        format_recent_tool_outputs(chat_id, thread_id, limit=10, max_chars=1200),
+        1200,
+    )
+    thread_ctx = _truncate_text(thread_ctx, 1600)
     blended = f"SIMILAR_CHANNEL:\n{similar_blend.get('channel') or '(none)'}\n\nSIMILAR_SERVER:\n{similar_blend.get('server') or '(none)'}\n\nSIMILAR_GLOBAL:\n{similar_blend.get('global') or '(none)'}"
     state_blob = internal_state or {}
     narrative = (state_blob.get("narrative") or "").strip()
@@ -2999,6 +3329,21 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
         NOW_UTC: {now_utc}
         NOW_LOCAL: {now_local}
 
+        CURRENT_USER:
+          id: {uid}
+          handle: {uhandle}
+          display_name: {uname}
+          is_admin: {is_admin}
+
+        CONVERSATION SNAPSHOT (latest first):
+        {recent_dialogue or '(none)'}
+
+        TOOL EVENTS:
+        {recent_tools_block or '(none)'}
+
+        THREAD CONTEXT (chronological view):
+        {thread_ctx or '(none)'}
+
         METRICS:
           servers_seen: {metrics['servers_count']}
           users_seen: {metrics['users_count']}
@@ -3008,12 +3353,6 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
         {public_block or '(none)'}
           admin:
         {admin_block or '(none)'}
-
-        CURRENT_USER:
-          id: {uid}
-          handle: {uhandle}
-          display_name: {uname}
-          is_admin: {is_admin}
 
         TOOL FUNCTIONS (admin visibility):
         {tool_catalog}
@@ -3080,15 +3419,6 @@ def build_ai_prompt(user_text: str, current_user, chat_id: int, thread_id: int,
         {ents_here}
           Top relations:
         {graph_here}
-
-        RECENT_DIALOGUE (latest to oldest):
-        {recent_dialogue}
-
-        RECENT_TOOL_OUTPUTS:
-        {format_recent_tool_outputs(chat_id, thread_id)}
-
-        THREAD_CONTEXT (recent here):
-        {thread_ctx or '(none)'}
 
         BLENDED_SIMILAR (channel > server > global):
         {blended}
@@ -4904,6 +5234,14 @@ async def handle_real_tool_execution(
                 raw_output = formatted_output
         chat_id = getattr(chat, "id", 0)
         thread_id = getattr(update.effective_message, "message_thread_id", None) or 0
+        log_chain_tool_event(
+            chat_id,
+            thread_id,
+            decision.tool_name or "tool",
+            raw_output,
+            state="completed" if result.success else "failed",
+            metadata={"source": "real_tool", "error": result.error} if result.error else {"source": "real_tool"},
+        )
         log_chain_agent_reply(
             chat_id,
             thread_id,
@@ -5103,6 +5441,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
                 tool_summary_entries = tool_summary
 
+                if tool_summary_entries:
+                    for entry in tool_summary_entries:
+                        tool_name = str(entry.get("tool") or entry.get("tool_name") or "tool") if isinstance(entry, dict) else "tool"
+                        raw_payload = ""
+                        if isinstance(entry, dict):
+                            raw_payload = str(entry.get("result_full") or entry.get("result_preview") or "")
+                        if raw_payload:
+                            log_chain_tool_event(
+                                chat.id,
+                                thread_id,
+                                tool_name,
+                                raw_payload,
+                                state=str(entry.get("state") if isinstance(entry, dict) else ""),
+                                metadata={"source": "auto_tool"},
+                            )
+
                 if plan_digests:
                     plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
                     plan_section = _truncate_for_telegram(plan_section, 1000)
@@ -5278,6 +5632,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tool_summary:
                 complexity_meta = {**complexity_meta, "tool_executions": tool_summary}
             tool_summary_entries = tool_summary
+
+            if tool_summary_entries:
+                for entry in tool_summary_entries:
+                    tool_name = str(entry.get("tool") or entry.get("tool_name") or "tool") if isinstance(entry, dict) else "tool"
+                    raw_payload = ""
+                    if isinstance(entry, dict):
+                        raw_payload = str(entry.get("result_full") or entry.get("result_preview") or "")
+                    if raw_payload:
+                        log_chain_tool_event(
+                            chat.id,
+                            thread_id,
+                            tool_name,
+                            raw_payload,
+                            state=str(entry.get("state") if isinstance(entry, dict) else ""),
+                            metadata={"source": "auto_tool"},
+                        )
             if plan_digests:
                 plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
                 plan_section = _truncate_for_telegram(plan_section, 1000)

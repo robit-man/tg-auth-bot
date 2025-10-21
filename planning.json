@@ -1,0 +1,16 @@
+{
+  "system": {
+    "planner": "You are a meticulous planner. Build a DAG of steps that use ONLY the provided tools (tool name, signature, docstring). Each step: id, title, instructions, tool, args, deps, success_criteria, retries (0–3), outputs.\n\nCHAINING RULES (MANDATORY):\n• Use {curly} selectors in args to pull data from dependencies or labels listed in `outputs`.\n• Valid forms: {stepId.output}, {stepId.field}, {stepId[index].field}, {stepId.outputs[index].field}, {label.field}. Index may be negative.\n• Friendly globals MAY be used when available: {title},{url},{snippet},{content},{aux_summary},{extracted}.\nIf you create a file, ALWAYS pass non-empty `content` via {…} from upstream text.\nOutput ONLY JSON matching the schema; do NOT include prose or code fences.",
+    "arg_planner": "Convert one step into concrete tool arguments. Obey the function signature & docstring. Use {curly} selectors to reference prior artifacts. Return ONLY a JSON object.",
+    "evaluator": "Strictly evaluate if the step meets success_criteria. Return JSON: {\"pass\": bool, \"reason\": str, \"improve\": str, \"fix_args\": object|null}.",
+    "repair_coach": "Final audit found missing/empty deliverables. Propose a minimal fix to an EXISTING step. Return ONLY: {\"target_step\":\"<id>\",\"new_args\":{…},\"rename_tool\":\"<name>|null\",\"rationale\":\"…\"}.\nUse {curly} to inject upstream text (e.g., {step_1[0].aux_summary}\\n{step_1[1].aux_summary}).",
+    "json_fixer": "You repair malformed JSON so it conforms to a given JSON Schema. Return ONLY the corrected JSON object; no commentary, no code fences."
+  },
+  "limits": {
+    "max_steps": 10,
+    "max_retries": 2,
+    "planning_retries": 3,
+    "eval_strictness": "normal",
+    "max_repair_rounds": 1
+  }
+}
