@@ -313,6 +313,13 @@ except ImportError:
     Tools = None  # type: ignore
     TOOLS_MODULE_AVAILABLE = False
 
+from agent_tasks import TaskManager, TaskStatus
+from agent_planner import TaskPlanner, PlannerConfig
+from agent_executor import TaskExecutor, ExecutionContext
+from agent_safety import load_policy, validate_final_reply
+from agent_capabilities import build_tool_index
+from agent_telemetry import configure as telemetry_configure, telemetry_event
+
 # ──────────────────────────────────────────────────────────────
 # 1) .env + config (auto-detect Ollama models)
 # ──────────────────────────────────────────────────────────────
@@ -431,6 +438,12 @@ FORCE_CURSES = ((os.getenv("FORCE_CURSES") or (CFG.get("FORCE_CURSES") or "false
 
 SLEEP_CYCLE_ENABLED = ((os.getenv("SLEEP_CYCLE_ENABLED") or (CFG.get("SLEEP_CYCLE_ENABLED") or "true")).strip().lower() == "true")
 SLEEP_CYCLE_TICK_SECONDS = int((os.getenv("SLEEP_CYCLE_TICK_SECONDS") or (CFG.get("SLEEP_CYCLE_TICK_SECONDS") or "60")).strip() or "60")
+
+TASK_ENGINE_ENABLED = ((os.getenv("TASK_ENGINE_ENABLED") or "true").strip().lower() != "false")
+PLANNER_FAST_MODEL = (os.getenv("PLANNER_FAST_MODEL") or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+PLANNER_STANDARD_MODEL = (os.getenv("PLANNER_STANDARD_MODEL") or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+PLANNER_ADVANCED_MODEL = (os.getenv("PLANNER_ADVANCED_MODEL") or OLLAMA_MODEL).strip() or OLLAMA_MODEL
+SAFETY_POLICY = load_policy(os.getenv("SAFETY_POLICY_PATH"))
 
 if not BOT_TOKEN:
     print("[env] BOT_TOKEN is empty. Set it and run again."); sys.exit(1)
@@ -675,6 +688,48 @@ def _condense_tool_entries(tool_entries: Optional[Iterable[Any]]) -> List[str]:
     return lines
 
 
+def _is_json_serializable(value: Any) -> bool:
+    try:
+        json.dumps(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _format_tool_context_snippet(
+    tool_name: str,
+    result: Any,
+    *,
+    user_request: Optional[str] = None,
+    default_text: str = "",
+    max_items: int = 5,
+) -> str:
+    if tool_name == "search_internet" and isinstance(result, list):
+        lines: List[str] = []
+        if user_request:
+            lines.append(f"Web search for: {user_request}")
+        count = 0
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or item.get("url") or "(untitled)").strip()
+            summary = (
+                (item.get("extracted") or "").strip()
+                or (item.get("aux_summary") or "").strip()
+                or (item.get("snippet") or "").strip()
+            )
+            if not title and not summary:
+                continue
+            count += 1
+            summary = summary[:600]
+            lines.append(f"{count}. {title}: {summary}" if summary else f"{count}. {title}")
+            if count >= max_items:
+                break
+        if lines:
+            return "\n".join(lines)
+    return default_text
+
+
 def _queue_chain_persist(
     role: str,
     chat_id: int,
@@ -765,6 +820,7 @@ def log_chain_tool_event(
     state: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     message_id: Optional[int] = None,
+    raw_output: Optional[str] = None,
 ) -> None:
     text = (output_text or "").strip()
     if not text:
@@ -780,6 +836,8 @@ def log_chain_tool_event(
         "ts": time.time(),
     }
     raw_record = {"tool": tool_name, "output": text}
+    if raw_output and raw_output.strip() and raw_output.strip() != text:
+        raw_record["raw"] = raw_output.strip()
     if meta:
         raw_record["metadata"] = meta
     entry["tools_raw"] = [raw_record]
@@ -1393,6 +1451,14 @@ async def ai_generate_async(payload: dict) -> Optional[str]:
 async def embed_text_async(text: str) -> Optional[List[float]]:
     return await asyncio.to_thread(embed_text, text)
 
+PLANNER_CONFIG = PlannerConfig(
+    fast_model=PLANNER_FAST_MODEL,
+    standard_model=PLANNER_STANDARD_MODEL,
+    advanced_model=PLANNER_ADVANCED_MODEL,
+)
+TASK_PLANNER = TaskPlanner(ai_generate_async, PLANNER_CONFIG)
+TASK_EXECUTOR = TaskExecutor()
+
 async def with_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, coro):
     stop = asyncio.Event()
     async def _typer():
@@ -1432,6 +1498,12 @@ async def _safe_send_reply(
     reply_to: Optional[Message] = None,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> Optional[Message]:
+    try:
+        validate_final_reply(text or "", SAFETY_POLICY)
+    except Exception as exc:
+        print(f"[safety] Final reply rejected: {exc}")
+        text = f"⚠️ Safety filter blocked reply: {exc}"
+
     cleaned = _truncate_for_telegram(text or "")
     if not cleaned.strip():
         cleaned = "⚠️ I couldn't form a reply just now—please try again or rephrase."
@@ -2568,6 +2640,38 @@ async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not message or not chat:
         return
+
+    thread_id = getattr(message, "message_thread_id", None) or 0
+    args_list = context.args or []
+    if args_list:
+        sub = args_list[0].lower()
+        if sub == "show":
+            tasks = await TaskManager.list_active_tasks(chat.id, thread_id)
+            if not tasks:
+                await message.reply_text("No active plans for this thread.")
+                return
+            lines = ["📋 <b>Active plans</b>"]
+            for task in tasks:
+                lines.append(
+                    f"• #{task.id} — {html.escape(task.title)} ({task.status.value})"
+                )
+            await message.reply_html("\n".join(lines))
+            return
+        if sub == "cancel":
+            if len(args_list) < 2:
+                await message.reply_text("Usage: /plan cancel <task_id>")
+                return
+            try:
+                task_id = int(args_list[1])
+            except ValueError:
+                await message.reply_text("Task id must be an integer")
+                return
+            await TaskManager.cancel_task(task_id, reason="user_cancel")
+            await message.reply_text(f"✅ Cancelled plan #{task_id}")
+            return
+        if sub == "step":
+            await message.reply_text("Step re-run support coming soon. For now use /plan show and /plan cancel.")
+            return
 
     if not TOOLS_MODULE_AVAILABLE or not Tools:
         await message.reply_text(
@@ -4441,6 +4545,99 @@ async def analyze_user_affect_intent(meta: dict, chat, thread_id: int, user, mes
     )
     return mood_state
 
+
+async def maybe_invoke_task_planner(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat,
+    thread_id: int,
+    user,
+    user_text: str,
+    thread_ctx: str,
+    complexity_meta: Dict[str, object],
+):
+    if not TASK_ENGINE_ENABLED:
+        return None
+    if complexity_meta.get("complexity") not in {"medium", "high"}:
+        return None
+    active = await TaskManager.list_active_tasks(chat.id, thread_id)
+    if active:
+        return None
+
+    context_snapshot = _truncate_text(
+        format_recent_dialogue(chat.id, thread_id, limit=12, max_chars=2000),
+        2000,
+    )
+    tool_events = _truncate_text(
+        format_recent_tool_outputs(chat.id, thread_id, limit=10, max_chars=1500),
+        1500,
+    )
+    try:
+        plan_model = await TASK_PLANNER.draft_plan(
+            chat_id=chat.id,
+            thread_id=thread_id,
+            user_prompt=user_text,
+            context_snapshot=context_snapshot,
+            tool_events=tool_events,
+            complexity_score=float(complexity_meta.get("confidence", 0.5)),
+        )
+    except Exception as exc:
+        print(f"[planner] plan drafting failed: {exc}")
+        telemetry_event(
+            "planner_error",
+            {
+                "chat_id": chat.id,
+                "thread_id": thread_id,
+                "error": str(exc),
+            },
+        )
+        return None
+
+    if not plan_model:
+        return None
+
+    task_record, step_records = TaskPlanner.plan_to_records(
+        plan_model,
+        chat.id,
+        thread_id,
+        getattr(user, "id", None),
+    )
+    task_record = await TaskManager.create_task(task_record, step_records)
+    await TaskManager.update_task_status(
+        task_record.id,
+        metadata={"planner": plan_model.dict(), "source": "auto"},
+    )
+
+    exec_ctx = ExecutionContext(
+        task_id=task_record.id,
+        chat_id=chat.id,
+        thread_id=thread_id,
+        user_id=getattr(user, "id", None),
+        complexity_score=float(complexity_meta.get("confidence", 0.5)),
+    )
+    asyncio.create_task(TASK_EXECUTOR.run(exec_ctx))
+
+    summary_lines = [
+        f"🧠 Planner initiated: {plan_model.objective}",
+        f"Steps: {len(plan_model.steps)} | Confidence: {complexity_meta.get('confidence', 0.0):.2f}",
+        "Use /plan show to review or /plan cancel to stop.",
+    ]
+    try:
+        await update.effective_message.reply_text("\n".join(summary_lines), quote=False)
+    except Exception:
+        pass
+
+    telemetry_event(
+        "planner_task_created",
+        {
+            "task_id": task_record.id,
+            "chat_id": chat.id,
+            "thread_id": thread_id,
+            "steps": len(plan_model.steps),
+        },
+    )
+    return task_record
+
 async def maybe_update_system_prompt_from_reflection(
     force: bool = False,
     sleep_context: Optional[Dict[str, Any]] = None,
@@ -5148,6 +5345,22 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.success:
             response = f"🖼️ Image Analysis:\n\n{result.description}"
 
+            context_text = _truncate_text(result.description, 1600)
+            if context_text:
+                log_chain_tool_event(
+                    chat.id,
+                    getattr(m, "message_thread_id", None) or 0,
+                    "vision_analyze_image",
+                    context_text,
+                    state="completed",
+                    metadata={
+                        "source": "vision",
+                        "model": result.model_used,
+                        "file": str(file_path),
+                    },
+                    raw_output=result.description,
+                )
+
             # If there's ongoing conversation context, offer to continue
             if chat.type == "private":
                 response += "\n\n💬 Feel free to ask questions about this image!"
@@ -5234,14 +5447,24 @@ async def handle_real_tool_execution(
                 raw_output = formatted_output
         chat_id = getattr(chat, "id", 0)
         thread_id = getattr(update.effective_message, "message_thread_id", None) or 0
-        log_chain_tool_event(
-            chat_id,
-            thread_id,
+        structured = result.output if _is_json_serializable(result.output) else None
+        context_text = _format_tool_context_snippet(
             decision.tool_name or "tool",
-            raw_output,
-            state="completed" if result.success else "failed",
-            metadata={"source": "real_tool", "error": result.error} if result.error else {"source": "real_tool"},
+            structured,
+            user_request=text,
+            default_text=raw_output,
         )
+        context_text = _truncate_text(context_text, 1600)
+        if context_text:
+            log_chain_tool_event(
+                chat_id,
+                thread_id,
+                decision.tool_name or "tool",
+                context_text,
+                state="completed" if result.success else "failed",
+                metadata={"source": "real_tool", "error": result.error} if result.error else {"source": "real_tool"},
+                raw_output=raw_output,
+            )
         log_chain_agent_reply(
             chat_id,
             thread_id,
@@ -5347,6 +5570,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 complexity_meta = {**complexity_meta, "actions_executed": executed_actions}
             if decision_meta:
                 complexity_meta = {**complexity_meta, "auto_reply_reason": decision_meta}
+
+            if TASK_ENGINE_ENABLED:
+                try:
+                    await maybe_invoke_task_planner(update, context, chat, thread_id, user, text, thread_ctx, complexity_meta)
+                except Exception as exc:
+                    print(f"[planner] invocation error: {exc}")
+
             payload = build_ai_prompt(text, user, chat.id, thread_id, thread_ctx, sim, kg_snap,
                                       internal_state=internal_state,
                                       context_bundle=context_bundle,
@@ -5392,12 +5622,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if digest:
                                 plan_digests.append(digest)
                                 preview_txt = digest
+                        structured = result_obj if _is_json_serializable(result_obj) else None
                         tool_summary.append(
                             {
                                 "tool": getattr(run, "tool_name", ""),
                                 "state": state_val,
                                 "result_preview": preview_txt[:200],
                                 "result_full": raw_text,
+                                "result_structured": structured,
                             }
                         )
                 if (not plan_digests and not plan_tool_seen and is_admin_user
@@ -5432,6 +5664,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     "state": "auto",
                                     "result_preview": preview_value,
                                     "result_full": raw_plan_text,
+                                    "result_structured": auto_plan_result if _is_json_serializable(auto_plan_result) else None,
                                 }
                             )
                     except Exception as exc:
@@ -5447,14 +5680,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         raw_payload = ""
                         if isinstance(entry, dict):
                             raw_payload = str(entry.get("result_full") or entry.get("result_preview") or "")
-                        if raw_payload:
+                        structured = entry.get("result_structured") if isinstance(entry, dict) else None
+                        context_text = _format_tool_context_snippet(
+                            tool_name,
+                            structured,
+                            user_request=text,
+                            default_text=raw_payload,
+                        )
+                        context_text = _truncate_text(context_text, 1600)
+                        if context_text:
                             log_chain_tool_event(
                                 chat.id,
                                 thread_id,
                                 tool_name,
-                                raw_payload,
+                                context_text,
                                 state=str(entry.get("state") if isinstance(entry, dict) else ""),
                                 metadata={"source": "auto_tool"},
+                                raw_output=raw_payload,
                             )
 
                 if plan_digests:
@@ -5578,6 +5820,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kg_snap = {"ents_here": kg_top_entities(chat.id, thread_id, 10),
                "rels_here": kg_top_relations(chat.id, thread_id, 10)}
     if ai_available():
+        if TASK_ENGINE_ENABLED:
+            try:
+                await maybe_invoke_task_planner(update, context, chat, thread_id, user, text, thread_ctx, complexity_meta)
+            except Exception as exc:
+                print(f"[planner] invocation error: {exc}")
         payload = build_ai_prompt(text, user, chat.id, thread_id, thread_ctx, sim, kg_snap,
                                   internal_state=internal_state,
                                   context_bundle=context_bundle,
@@ -5621,12 +5868,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if digest:
                             plan_digests.append(digest)
                             preview_txt = digest
+                    structured = result_obj if _is_json_serializable(result_obj) else None
                     tool_summary.append(
                         {
                             "tool": getattr(run, "tool_name", ""),
                             "state": state_val,
                             "result_preview": preview_txt[:200],
                             "result_full": raw_text,
+                            "result_structured": structured,
                         }
                     )
             if tool_summary:
@@ -5639,14 +5888,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raw_payload = ""
                     if isinstance(entry, dict):
                         raw_payload = str(entry.get("result_full") or entry.get("result_preview") or "")
-                    if raw_payload:
+                    structured = entry.get("result_structured") if isinstance(entry, dict) else None
+                    context_text = _format_tool_context_snippet(
+                        tool_name,
+                        structured,
+                        user_request=text,
+                        default_text=raw_payload,
+                    )
+                    context_text = _truncate_text(context_text, 1600)
+                    if context_text:
                         log_chain_tool_event(
                             chat.id,
                             thread_id,
                             tool_name,
-                            raw_payload,
+                            context_text,
                             state=str(entry.get("state") if isinstance(entry, dict) else ""),
                             metadata={"source": "auto_tool"},
+                            raw_output=raw_payload,
                         )
             if plan_digests:
                 plan_section = "🧭 Planner outcome:\n" + "\n".join(f"- {line}" for line in plan_digests)
@@ -6001,6 +6259,15 @@ def main():
     global DBW
     DBW = DBWriteQueue()
     DBW.start()
+    TaskManager.configure(str(DB_PATH), DBW, db)
+    telemetry_configure(str(DB_PATH), DBW, db)
+    build_tool_index()
+    TASK_EXECUTOR.configure_runtime(
+        generate_reply=generate_agentic_reply,
+        log_tool_event=log_chain_tool_event,
+        format_tool_context=_format_tool_context_snippet,
+        truncate_text=_truncate_text,
+    )
 
     # Initialize sleep cycle if enabled
     if SLEEP_CYCLE_ENABLED and SLEEP_CYCLE_AVAILABLE:
