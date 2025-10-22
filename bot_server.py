@@ -62,6 +62,43 @@ IS_WIN = os.name == "nt"
 def _venv_python(p: Path) -> Path:
     return p / ("Scripts/python.exe" if IS_WIN else "bin/python")
 
+def _ensure_pip(py_executable: str) -> bool:
+    """
+    Verify that `python -m pip` works in the target interpreter.
+    If it fails, attempt to bootstrap pip via ensurepip.
+    """
+    def _check_pip() -> bool:
+        try:
+            result = subprocess.run(
+                [py_executable, "-m", "pip", "--version"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            if result.stdout:
+                print(f"[bootstrap]   pip detected ({result.stdout.strip()})")
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    if _check_pip():
+        return True
+
+    print("[bootstrap] pip missing; attempting ensurepip ...")
+    ensure_result = subprocess.run(
+        [py_executable, "-m", "ensurepip", "--upgrade"],
+        capture_output=True,
+        text=True,
+    )
+    if ensure_result.returncode != 0:
+        if ensure_result.stderr:
+            print(f"[bootstrap]   ensurepip stderr: {ensure_result.stderr.strip()}")
+        return False
+
+    return _check_pip()
+
+EMOJI_REGEX = re.compile(r'[\u2600-\u26FF\U0001F300-\U0001FAFF]')
+
 def ensure_venv_and_deps():
     if os.environ.get("VIRTUAL_ENV") or str(sys.prefix).endswith(".venv"):
         return
@@ -78,8 +115,22 @@ def ensure_venv_and_deps():
         subprocess.check_call([sys.executable, "-m", "venv", str(VENV)])
 
     py = str(_venv_python(VENV))
+
+    if not _ensure_pip(py):
+        print("[bootstrap] ERROR: pip is unavailable inside the virtualenv.")
+        print("[bootstrap] Hints: ensure the python venv module is installed (e.g. `apt install python3-venv`), or install pip manually and rerun.")
+        raise SystemExit(1)
+
     print("[bootstrap] Upgrading pip/setuptools/wheel ...")
-    subprocess.check_call([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    upgrade = subprocess.run(
+        [py, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+        capture_output=True,
+        text=True,
+    )
+    if upgrade.returncode != 0:
+        print(f"[bootstrap]   ⚠ pip upgrade failed (code {upgrade.returncode}). Continuing with existing pip.")
+        if upgrade.stderr:
+            print(f"[bootstrap]   stderr: {upgrade.stderr.strip()[:400]}")
 
     # Core requirements - MUST install
     reqs = [
@@ -3904,7 +3955,7 @@ async def should_auto_reply_async(message, chat, user, thread_ctx_text: str,
         f"question={bool('?' in text)}",
         f"length={len(text)}",
         f"contains_link={bool(re.search(r'https?://', text))}",
-        f"emoji={bool(re.search(r'[\\u2600-\\u26FF\\U0001F300-\\U0001FAFF]', text))}",
+        f"emoji={bool(EMOJI_REGEX.search(text))}",
         f"all_caps={text.isupper()}",
         f"reply_to_bot={reply_to_bot}",
         f"user_id={getattr(user, 'id', 0) if user else 0}",
