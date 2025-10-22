@@ -552,6 +552,7 @@ MAX_CONTEXT_GROUPS = int(os.getenv("MAX_CONTEXT_GROUPS") or 30)
 DEBUG_FLAGS: Dict[int, bool] = defaultdict(bool)
 DEBUG_CONTEXTS: Dict[tuple[int, int], Dict[str, str]] = {}
 SELF_CHECK_CONTEXTS: Dict[tuple[int, int], str] = {}
+INTERACTIVE_BASE: Dict[tuple[int, int], Dict[str, Any]] = {}
 
 CHAIN_LOG_MAX_LEN = 16
 CHAIN_HISTORY_STORE_LIMIT = max(CHAIN_LOG_MAX_LEN * 6, 64)
@@ -2270,11 +2271,11 @@ async def glean_facts_background(row_id: int):
 # ──────────────────────────────────────────────────────────────
 def command_catalog() -> Dict[str, List[tuple]]:
     public = [
-        ("/start", "Unlock chat (tap the pinned Start link in the group first)."),
-        ("/inspect <link|@user|id>", "Show IDs/metadata for users/chats."),
+        ("/help", "Interactive help menu with buttons."),
         ("/commands", "Show available commands tailored to you."),
         ("/topic", "Show top entities & relations in this channel."),
         ("/profile", "Manage your interaction profile (DM me)."),
+        ("/start", "Unlock chat (tap the pinned Start link first)."),
     ]
     admin = [
         ("/setup", "Make this group read-only & print Start link."),
@@ -2286,12 +2287,13 @@ def command_catalog() -> Dict[str, List[tuple]]:
         ("/users [here|primary] [page] [size] [q=...]", "List unlocked users."),
         ("/message <user_id|@username> <text...>", "DM a user via the bot."),
         ("/system <text>", "Set the system prompt."),
-        ("/inspect <link|@user|id>", "Inspector."),
         ("/graph [here|server] [N]", "Show KG relations."),
         ("/autosystem [why]", "Regenerate the system prompt."),
         ("/tools", "List available tool functions exposed to the AI."),
         ("/chain", "Show recent user↔agent exchanges for this chat/thread."),
         ("/plan <objective>", "Delegate a complex multi-step task to the autonomous planner."),
+        ("/inspect <link|@user|id>", "Inspector."),
+        ("/debug on|off", "Toggle debug context buttons."),
     ]
     return {"public": public, "admin": admin}
 
@@ -2303,6 +2305,75 @@ def format_commands_for_user(is_admin: bool) -> str:
         lines.append("\nAdmin:")
         for cmd, help_ in cat["admin"]: lines.append(f"  {cmd} — {help_}")
     return "\n".join(lines)
+
+
+HELP_ENTRIES: List[Dict[str, Any]] = [
+    {"id": "help", "name": "/help", "description": "Interactive help menu with buttons.", "usage": "/help", "admin": False},
+    {"id": "commands", "name": "/commands", "description": "Show available commands tailored to your role.", "usage": "/commands", "admin": False},
+    {"id": "topic", "name": "/topic", "description": "Show top entities and relations for this thread.", "usage": "/topic", "admin": False},
+    {"id": "profile", "name": "/profile", "description": "View or manage your interaction profile (DM only).", "usage": "/profile show|now|erase|optout on|off", "admin": False},
+    {"id": "start", "name": "/start", "description": "Unlock yourself using the group's Start link.", "usage": "/start unlock_<token>", "admin": False},
+    {"id": "setup", "name": "/setup", "description": "Make this group read-only and print the Start link.", "usage": "/setup", "admin": True},
+    {"id": "ungate", "name": "/ungate", "description": "Restore permissive defaults for this group.", "usage": "/ungate", "admin": True},
+    {"id": "link", "name": "/link", "description": "Show the Start link for this group.", "usage": "/link", "admin": True},
+    {"id": "linkprimary", "name": "/linkprimary", "description": "Show the primary group's Start link.", "usage": "/linkprimary", "admin": True},
+    {"id": "setprimary", "name": "/setprimary", "description": "Mark this group as the primary gating server.", "usage": "/setprimary", "admin": True},
+    {"id": "config", "name": "/config", "description": "Show environment configuration and service status.", "usage": "/config", "admin": True},
+    {"id": "users", "name": "/users", "description": "List unlocked users (filterable).", "usage": "/users [here|primary] [page] [size] [q=...]", "admin": True},
+    {"id": "message", "name": "/message", "description": "Send a DM to a user via the bot.", "usage": "/message <user_id|@username> <text...>", "admin": True},
+    {"id": "system", "name": "/system", "description": "Replace the system prompt.", "usage": "/system <text>", "admin": True},
+    {"id": "inspect", "name": "/inspect", "description": "Inspect link, user, or chat metadata.", "usage": "/inspect <link|@user|id>", "admin": True},
+    {"id": "graph", "name": "/graph", "description": "Show knowledge graph relations or server-wide summary.", "usage": "/graph [here|server] [N]", "admin": True},
+    {"id": "autosystem", "name": "/autosystem", "description": "Regenerate the system prompt and explain why.", "usage": "/autosystem [reason]", "admin": True},
+    {"id": "tools", "name": "/tools", "description": "List tool functions exposed to the AI.", "usage": "/tools", "admin": True},
+    {"id": "chain", "name": "/chain", "description": "Show recent user↔assistant exchanges.", "usage": "/chain", "admin": True},
+    {"id": "plan", "name": "/plan", "description": "Delegate a complex multi-step task to the planner.", "usage": "/plan <objective>\n/plan show\n/plan cancel <task_id>", "admin": True},
+    {"id": "debug", "name": "/debug", "description": "Toggle debug context buttons for this chat.", "usage": "/debug on|off", "admin": True},
+]
+
+_HELP_ENTRY_MAP: Dict[str, Dict[str, Any]] = {entry["id"]: entry for entry in HELP_ENTRIES}
+
+
+def _help_main_text(is_admin: bool) -> str:
+    suffix = " (admin commands listed)" if is_admin else ""
+    return textwrap.dedent(
+        f"""
+        <b>Command Help{suffix}</b>
+        Tap a command to view its usage and description.
+        """
+    ).strip()
+
+
+def _help_entries_for_user(is_admin: bool) -> List[Dict[str, Any]]:
+    return [entry for entry in HELP_ENTRIES if is_admin or not entry.get("admin")]
+
+
+def _help_main_markup(is_admin: bool) -> InlineKeyboardMarkup:
+    entries = _help_entries_for_user(is_admin)
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for entry in entries:
+        row.append(InlineKeyboardButton(entry["name"], callback_data=f"help:cmd|{entry['id']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def _help_detail_text(entry: Dict[str, Any]) -> str:
+    admin_note = "\n\n<em>Admin only</em>" if entry.get("admin") else ""
+    return textwrap.dedent(
+        f"""
+        <b>{html.escape(entry['name'])}</b>{admin_note}
+
+        {html.escape(entry['description'])}
+
+        <b>Usage</b>
+        <code>{html.escape(entry['usage'])}</code>
+        """
+    ).strip()
 
 @whitelist_only
 async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2332,6 +2403,68 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     is_admin = uid in ADMIN_WHITELIST if uid else False
     await update.effective_message.reply_text(format_commands_for_user(is_admin))
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    is_admin = user.id in ADMIN_WHITELIST if user else False
+    text = _help_main_text(is_admin)
+    markup = _help_main_markup(is_admin)
+    await update.effective_message.reply_html(
+        text,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
+
+
+async def help_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    user = query.from_user
+    is_admin = user.id in ADMIN_WHITELIST if user else False
+    data = query.data or ""
+
+    if data == "help:back":
+        text = _help_main_text(is_admin)
+        markup = _help_main_markup(is_admin)
+        try:
+            await query.edit_message_text(
+                text,
+                reply_markup=markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await query.answer("Unable to update message.", show_alert=True)
+            return
+        await query.answer()
+        return
+
+    if data.startswith("help:cmd|"):
+        cmd_id = data.split("|", 1)[1]
+        entry = _HELP_ENTRY_MAP.get(cmd_id)
+        if not entry or (entry.get("admin") and not is_admin):
+            await query.answer("Not available.", show_alert=True)
+            return
+        detail_text = _help_detail_text(entry)
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="help:back")]]
+        )
+        try:
+            await query.edit_message_text(
+                detail_text,
+                reply_markup=markup,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await query.answer("Unable to update message.", show_alert=True)
+            return
+        await query.answer()
+        return
+
+    await query.answer()
 
 
 @whitelist_only
@@ -2390,20 +2523,42 @@ async def chain_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat:
         await query.answer()
         return
-    thread_id = getattr(query.message, "message_thread_id", None) or 0
-    summary = build_chain_summary(chat.id, thread_id, limit=6)
-    try:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=summary,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_to_message_id=query.message.message_id,
+    action = (query.data or "").split(":", 1)[1]
+    key = (chat.id, query.message.message_id)
+
+    if action == "show":
+        thread_id = getattr(query.message, "message_thread_id", None) or 0
+        summary = build_chain_summary(chat.id, thread_id, limit=6)
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="chain:back")]]
         )
-    except Exception:
-        await query.answer("Unable to send chain summary.", show_alert=True)
+        try:
+            await query.edit_message_text(
+                summary,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await query.answer("Unable to update message.", show_alert=True)
+            return
+        await query.answer()
         return
-    await query.answer()
+
+    if action == "back":
+        base = INTERACTIVE_BASE.get(key)
+        if not base:
+            await query.answer("Original message unavailable.", show_alert=True)
+            return
+        try:
+            await query.edit_message_text(
+                base.get("text", ""),
+                reply_markup=base.get("markup"),
+            )
+        except Exception:
+            await query.answer("Unable to restore message.", show_alert=True)
+            return
+        await query.answer()
 
 
 async def selfcheck_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2418,22 +2573,43 @@ async def selfcheck_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat:
         await query.answer()
         return
+    action = (query.data or "").split(":", 1)[1]
     key = (chat.id, query.message.message_id)
-    payload = SELF_CHECK_CONTEXTS.get(key)
-    if not payload:
-        await query.answer("Self-check unavailable.", show_alert=True)
-        return
-    try:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=f"🧠 Self-check:\n{payload}",
-            reply_to_message_id=query.message.message_id,
-            disable_web_page_preview=True,
+
+    if action == "show":
+        payload = SELF_CHECK_CONTEXTS.get(key)
+        if not payload:
+            await query.answer("Self-check unavailable.", show_alert=True)
+            return
+        markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Back", callback_data="selfcheck:back")]]
         )
-    except Exception:
-        await query.answer("Unable to share self-check.", show_alert=True)
+        try:
+            await query.edit_message_text(
+                f"🧠 Self-check:\n{payload}",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await query.answer("Unable to update message.", show_alert=True)
+            return
+        await query.answer()
         return
-    await query.answer()
+
+    if action == "back":
+        base = INTERACTIVE_BASE.get(key)
+        if not base:
+            await query.answer("Original message unavailable.", show_alert=True)
+            return
+        try:
+            await query.edit_message_text(
+                base.get("text", ""),
+                reply_markup=base.get("markup"),
+            )
+        except Exception:
+            await query.answer("Unable to restore message.", show_alert=True)
+            return
+        await query.answer()
 
 # ──────────────────────────────────────────────────────────────
 # 12) Admin gating, inspector, setadmin flow
@@ -5811,6 +5987,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "response": reply_msg.text,
                         "context": debug_context_text,
                     }
+                if reply_msg:
+                    INTERACTIVE_BASE[(reply_msg.chat_id, reply_msg.message_id)] = {
+                        "text": reply_msg.text,
+                        "markup": reply_markup,
+                    }
                 if self_check_text and reply_msg:
                     SELF_CHECK_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = self_check_text
                 sent_text = reply_msg.text if reply_msg else _truncate_for_telegram(resp)
@@ -6017,6 +6198,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 DEBUG_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = {
                     "response": reply_msg.text,
                     "context": debug_context_text,
+                }
+            if reply_msg:
+                INTERACTIVE_BASE[(reply_msg.chat_id, reply_msg.message_id)] = {
+                    "text": reply_msg.text,
+                    "markup": reply_markup,
                 }
             if self_check_text and reply_msg:
                 SELF_CHECK_CONTEXTS[(reply_msg.chat_id, reply_msg.message_id)] = self_check_text
@@ -6365,6 +6551,7 @@ def main():
     app.add_handler(CallbackQueryHandler(agree_cb, pattern=r"^agree:\-?\d+$"))
 
     # Admin tools
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("config", config_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("message", message_cmd))
@@ -6383,8 +6570,9 @@ def main():
     app.add_handler(CommandHandler("setadmin", setadmin_cmd))
     app.add_handler(CallbackQueryHandler(adminreq_cb, pattern=r"^adminreq:(approve|deny):\d+$"))
     app.add_handler(CallbackQueryHandler(debug_toggle_cb, pattern=r"^debug:(show|hide)$"))
-    app.add_handler(CallbackQueryHandler(chain_cb, pattern=r"^chain:show$"))
-    app.add_handler(CallbackQueryHandler(selfcheck_cb, pattern=r"^selfcheck:show$"))
+    app.add_handler(CallbackQueryHandler(chain_cb, pattern=r"^chain:(show|back)$"))
+    app.add_handler(CallbackQueryHandler(selfcheck_cb, pattern=r"^selfcheck:(show|back)$"))
+    app.add_handler(CallbackQueryHandler(help_cb, pattern=r"^help:"))
 
     # Tool execution callbacks (confirmation and rating)
     if REAL_TOOL_EXECUTION_AVAILABLE:
